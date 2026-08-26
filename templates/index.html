@@ -1,160 +1,34 @@
 <!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Proxy IP & IP2Location Checker</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Proxy IP Intelligence Checker</title>
 <style>
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f5f7fb;color:#111827}
-main{max-width:1500px;margin:auto;padding:20px}
-.card{background:white;border:1px solid #e5e7eb;border-radius:16px;padding:18px;box-shadow:0 4px 18px rgba(0,0,0,.05);margin-bottom:16px}
-textarea{width:100%;box-sizing:border-box;min-height:180px;padding:14px;border:1px solid #d1d5db;border-radius:12px;font:14px ui-monospace,SFMono-Regular,Menlo,monospace}
-button{border:0;border-radius:10px;padding:11px 16px;font-weight:700;cursor:pointer;background:#111827;color:white}.secondary{background:#e5e7eb;color:#111827}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}.muted{color:#6b7280;font-size:13px}
-.tablewrap{overflow:auto}.bar{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px}
-table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}th,td{padding:9px;border-bottom:1px solid #eee;text-align:left}th{position:sticky;top:0;background:#fafafa;z-index:2}
-.good{color:#047857;font-weight:700}.bad{color:#b91c1c;font-weight:700}
-.badge{display:inline-block;padding:3px 7px;border-radius:999px;background:#eef2ff;font-size:12px}
-.clickcopy{cursor:pointer;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:3px}
-.clickcopy:hover{opacity:.7}
-.source{font-size:11px;color:#6b7280}
-.toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:#111827;color:white;padding:9px 14px;border-radius:999px;opacity:0;pointer-events:none;transition:.15s}
-.toast.show{opacity:1}
-@media(max-width:700px){main{padding:10px}.card{padding:13px}table{font-size:12px}}
-</style>
-</head>
-<body>
-<main>
-<div class="card">
-<h2 style="margin-top:0">Proxy IP & IP2Location Checker</h2>
-<div class="muted">Paste one proxy per line. Supported: host:port:user:pass. Up to 50 per run. Proxy checks and IP lookups run concurrently.</div>
-<textarea id="proxies" placeholder="host:port:username:password&#10;host:port:username:password"></textarea>
-<div class="row">
-<button id="check">Check proxies</button>
-<button class="secondary" id="clear">Clear</button>
-<span id="status" class="muted"></span>
-</div>
-</div>
-
-<div class="card tablewrap">
-<div class="bar"><strong>Results</strong><span id="counts" class="muted"></span></div>
-<table>
-<thead><tr>
-<th>Proxy</th><th>Status</th><th>Detected IP</th><th>Type</th><th>ms</th>
-<th>Country</th><th>Region</th><th>City</th><th>ISP</th><th>ASN</th><th>AS name</th>
-<th>Usage</th><th>Proxy?</th><th>Fraud</th><th>Proxy detection</th><th>Error</th><th>Source</th>
-</tr></thead>
-<tbody id="out"></tbody>
-</table>
-</div>
-
-<div class="muted" style="text-align:center;padding-bottom:20px">
-<a href="/logout">Log out</a> · Click a proxy or detected IP to copy it.
-· IP detection: ipify.org through the supplied proxy.
-· Geolocation/proxy intelligence: IP2Location.io.
-</div>
-</main>
-<div id="toast" class="toast">Copied</div>
-
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f5f7fb;color:#111827}main{max-width:1500px;margin:auto;padding:12px}.card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:16px;box-shadow:0 4px 18px rgba(0,0,0,.05);margin-bottom:14px}textarea{width:100%;box-sizing:border-box;min-height:180px;padding:14px;border:1px solid #d1d5db;border-radius:12px;font:14px ui-monospace,SFMono-Regular,Menlo,monospace}button{border:0;border-radius:10px;padding:11px 16px;font-weight:700;cursor:pointer;background:#111827;color:#fff}.secondary{background:#e5e7eb;color:#111827}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}.muted{color:#6b7280;font-size:13px}.tablewrap{overflow:auto}.bar{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px}table{width:100%;border-collapse:collapse;font-size:12px;white-space:nowrap}th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}th{position:sticky;top:0;background:#fafafa;z-index:2}.good{color:#047857;font-weight:700}.bad{color:#b91c1c;font-weight:700}.warn{color:#b45309;font-weight:700}.copy{cursor:pointer;text-decoration:underline;text-decoration-style:dotted}.src{font-size:10px;color:#6b7280;margin-top:2px;white-space:normal}.pill{display:inline-block;padding:3px 7px;border-radius:999px;background:#eef2ff;font-size:11px}.toast{position:fixed;left:50%;bottom:25px;transform:translateX(-50%);background:#111827;color:#fff;padding:9px 14px;border-radius:999px;display:none;z-index:20}.modalwrap{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:15;padding:10px}.modal{background:#fff;max-width:980px;max-height:90vh;overflow:auto;margin:4vh auto;border-radius:16px;padding:18px}.modal table{white-space:normal}.modal td:first-child{font-weight:700;width:220px}.close{float:right;background:#e5e7eb;color:#111827}@media(max-width:700px){main{padding:7px}.card{padding:12px}table{font-size:11px}.modal td:first-child{width:130px}}
+</style></head><body><main>
+<div class="card"><h2 style="margin-top:0">Proxy IP Intelligence Checker</h2>
+<div class="muted">Paste one proxy per line: <code>host:port:username:password</code>. Max 50 lines. Credentials are used only for the proxy connection and are not sent to enrichment providers.</div>
+<textarea id="proxies" placeholder="hostname:port:username:password&#10;hostname:port:username:password"></textarea>
+<div class="row"><button id="check">Check proxies</button><button class="secondary" id="clear">Clear</button><span id="status" class="muted"></span></div></div>
+<div class="card"><div class="bar"><strong>Results</strong><span id="counts" class="muted"></span></div><div class="tablewrap"><table><thead><tr>
+<th>Proxy</th><th>Status</th><th>Detected IP</th><th>Type</th><th>ms</th><th>Location</th><th>ISP</th><th>ASN</th><th>Usage</th><th>IP2Location proxy</th><th>DB-IP risk/proxy</th><th>Fraud score</th><th>Risk</th><th>Sources</th><th>Details</th><th>Error</th>
+</tr></thead><tbody id="out"></tbody></table></div></div>
+<div class="muted" style="text-align:center;padding-bottom:18px">Uses <a href="https://www.ip2location.io" target="_blank">IP2Location.io</a> and <a href="https://db-ip.com" target="_blank">DB-IP</a>. IP2Location.io Free/keyless attribution required. · <a href="/logout">Log out</a></div>
+</main><div class="toast" id="toast"></div><div class="modalwrap" id="mw"><div class="modal"><button class="close secondary" id="close">Close</button><h3 id="dt"></h3><div id="db"></div></div></div>
 <script>
-const $=s=>document.querySelector(s);
-
-$('#clear').onclick=()=>{
-  $('#proxies').value='';
-  $('#out').innerHTML='';
-  $('#status').textContent='';
-  $('#counts').textContent='';
-};
-
-async function copyText(value){
-  if(!value) return;
-  try{
-    await navigator.clipboard.writeText(value);
-  }catch(e){
-    const ta=document.createElement('textarea');
-    ta.value=value; document.body.appendChild(ta); ta.select();
-    document.execCommand('copy'); ta.remove();
-  }
-  const t=$('#toast');
-  t.textContent='Copied: '+value;
-  t.classList.add('show');
-  clearTimeout(window.copyToastTimer);
-  window.copyToastTimer=setTimeout(()=>t.classList.remove('show'),1200);
-}
-
-function clickable(value, cls=''){
-  if(!value) return '';
-  return `<span class="clickcopy ${cls}" title="Click to copy" data-copy="${esc(value)}">${esc(value)}</span>`;
-}
-
-$('#out').addEventListener('click', e=>{
-  const el=e.target.closest('[data-copy]');
-  if(el) copyText(el.getAttribute('data-copy'));
-});
-
-$('#check').onclick=async()=>{
-  const text=$('#proxies').value.trim();
-  if(!text){$('#status').textContent='Paste some proxies first.';return;}
-  $('#check').disabled=true;
-  $('#status').textContent='Checking proxies and looking up detected IPs...';
-  $('#out').innerHTML='';
-  try{
-    const r=await fetch('/api/check',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({text})
-    });
-    const data=await r.json();
-    if(!r.ok) throw new Error(data.error||'Request failed');
-
-    let online=0;
-    $('#out').innerHTML=data.results.map(x=>{
-      if(x.status==='online') online++;
-      const proxyDet = [
-        x.proxy_detection_type ? `type=${x.proxy_detection_type}` : '',
-        x.is_vpn===true ? 'VPN' : '',
-        x.is_tor===true ? 'TOR' : '',
-        x.is_data_center===true ? 'DCH' : '',
-        x.is_public_proxy===true ? 'PUB' : '',
-        x.is_web_proxy===true ? 'WEB' : '',
-        x.is_residential_proxy===true ? 'RES' : ''
-      ].filter(Boolean).join(' · ');
-
-      return `<tr>
-        <td>${clickable(x.proxy)}</td>
-        <td class="${x.status==='online'?'good':'bad'}">${esc(x.status)}</td>
-        <td>${clickable(x.exit_ip,'good')}</td>
-        <td><span class="badge">${esc(x.proxy_type||'')}</span></td>
-        <td>${esc(x.response_ms??'')}</td>
-        <td>${esc(x.country||'')}</td>
-        <td>${esc(x.region||'')}</td>
-        <td>${esc(x.city||'')}</td>
-        <td>${esc(x.isp||'')}</td>
-        <td>${esc(x.asn||'')}</td>
-        <td>${esc(x.as_name||'')}</td>
-        <td>${esc(x.usage_type||'')}</td>
-        <td>${x.is_proxy===true?'true':x.is_proxy===false?'false':''}</td>
-        <td>${esc(x.fraud_score??'')}</td>
-        <td>${esc(proxyDet)}</td>
-        <td class="bad">${esc(x.error||x.location_error||'')}</td>
-        <td class="source">${x.status==='online'?'ipify + IP2Location.io':''}</td>
-      </tr>`;
-    }).join('');
-
-    $('#counts').textContent=`${online}/${data.results.length} online · ${data.unique_ips_looked_up} unique IP lookup(s) · ${data.lookup_mode}`;
-    $('#status').textContent='Done';
-  }catch(e){
-    $('#status').textContent=e.message;
-  }finally{
-    $('#check').disabled=false;
-  }
-};
-
-function esc(v){
-  return String(v??'').replace(/[&<>"']/g,m=>({
-    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-  }[m]));
-}
-</script>
-</body>
-</html>
+const $=s=>document.querySelector(s);let results=[];
+function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+function first(...v){return v.find(x=>x!==null&&x!==undefined&&x!=='');}
+function copyText(v){if(!v)return;navigator.clipboard.writeText(v).then(()=>{const t=$('#toast');t.textContent='Copied';t.style.display='block';setTimeout(()=>t.style.display='none',900)}).catch(()=>{const a=document.createElement('textarea');a.value=v;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();});}
+function val(srcs,key){for(const [name,o] of srcs){if(o&&o[key]!==undefined&&o[key]!==null&&o[key]!=='')return {v:o[key],s:name};}return {v:'—',s:''};}
+function sourceLine(items){return items.filter(Boolean).join(' · ')}
+$('#clear').onclick=()=>{$('#proxies').value='';$('#out').innerHTML='';$('#status').textContent='';$('#counts').textContent='';};
+$('#close').onclick=()=>$('#mw').style.display='none';$('#mw').onclick=e=>{if(e.target.id==='mw')$('#mw').style.display='none'};
+$('#check').onclick=async()=>{const text=$('#proxies').value.trim();if(!text){$('#status').textContent='Paste some proxies first.';return}$('#check').disabled=true;$('#status').textContent='Checking proxies…';$('#out').innerHTML='';
+try{const r=await fetch('/api/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});const d=await r.json();if(!r.ok)throw new Error(d.error||'Request failed');results=d.results;let online=0;
+$('#out').innerHTML=results.map((x,i)=>{if(x.status==='online')online++;const s=x.sources||{};const pairs=[['IP2Location',s['IP2Location']],['DB-IP',s['DB-IP']],['Scamalytics',s['Scamalytics']]];const loc=val(pairs,'country');const region=val(pairs,'region');const city=val(pairs,'city');const isp=val(pairs,'isp');const asn=val(pairs,'asn');const usage=val(pairs,'usage_type');const fraud=val([['Scamalytics',s.Scamalytics],['IP2Location',s.IP2Location]],'fraud_score');const risk=val([['Scamalytics',s.Scamalytics],['DB-IP',s['DB-IP']]],'risk');const i2p=s.IP2Location||{},db=s['DB-IP']||{};
+return `<tr><td class="copy" title="Tap to copy" data-copy="${esc(x.proxy)}">${esc(x.proxy)}</td><td class="${x.status==='online'?'good':'bad'}">${esc(x.status)}</td><td class="copy" title="Tap to copy" data-copy="${esc(x.exit_ip||'')}"><b>${esc(x.exit_ip||'—')}</b></td><td><span class="pill">${esc(x.proxy_type||'')}</span></td><td>${esc(x.response_ms??'')}</td><td>${esc([loc.v,region.v,city.v].filter(z=>z!=='—').join(' / ')||'—')}<div class="src">${esc(sourceLine([loc.s,region.s,city.s]))}</div></td><td>${esc(isp.v)}<div class="src">${esc(isp.s)}</div></td><td>${esc(asn.v)}<div class="src">${esc(asn.s)}</div></td><td>${esc(usage.v)}<div class="src">${esc(usage.s)}</div></td><td>${fmtBool(i2p.is_proxy)}<div class="src">IP2Location</div></td><td>${fmtBool(db.is_proxy)}${db.proxy_type?' / '+esc(db.proxy_type):''}${db.threat_level?' / '+esc(db.threat_level):''}<div class="src">DB-IP</div></td><td class="${fraud.v!=='—'&&Number(fraud.v)>=60?'bad':fraud.v!=='—'&&Number(fraud.v)>=20?'warn':'good'}">${esc(fraud.v)}<div class="src">${esc(fraud.s)}</div></td><td>${esc(risk.v)}<div class="src">${esc(risk.s)}</div></td><td>${esc(Object.keys(s).join(' · ')||'—')}</td><td><button class="secondary" onclick="details(${i})">View</button></td><td class="bad">${esc(x.error||Object.entries(x.source_errors||{}).map(([k,v])=>k+': '+v).join(' | '))}</td></tr>`}).join('');
+$('#counts').textContent=`${online}/${results.length} online · ${d.unique_ips_looked_up} unique IPs enriched`;$statusText=d.scamalytics_enabled?'Done · Scamalytics enabled':'Done';$('#status').textContent=$statusText;
+}catch(e){$('#status').textContent=e.message}finally{$('#check').disabled=false}};
+function fmtBool(v){return v===true?'<span class="good">Yes</span>':v===false?'No':'—'}
+document.addEventListener('click',e=>{const el=e.target.closest('[data-copy]');if(el)copyText(el.getAttribute('data-copy'))});
+function details(i){const x=results[i],s=x.sources||{};$('#dt').textContent=`${x.exit_ip||'—'} · Proxy ${i+1}`;let rows=[['Proxy connection',x.proxy_type||''],['Response time',x.response_ms?x.response_ms+' ms':''],['Detected IP',x.exit_ip||'']];for(const n of ['IP2Location','DB-IP','Scamalytics']){rows.push([n,'']);const o=s[n];if(!o){rows.push(['Status','No data']);continue}for(const [k,v] of Object.entries(o)){if(v!==null&&v!==undefined&&v!=='')rows.push([k,typeof v==='object'?JSON.stringify(v):v]);}}$('#db').innerHTML='<table>'+rows.map(([a,b],j)=>`<tr><td>${esc(a)}</td><td>${esc(b)}</td></tr>`).join('')+'</table>';$('#mw').style.display='block'}
+</script></body></html>
