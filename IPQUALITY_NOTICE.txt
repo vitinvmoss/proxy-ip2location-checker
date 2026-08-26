@@ -1,0 +1,6 @@
+IPQuality integration notice
+
+This project references and interoperates with the open-source IPQuality project by xykt:
+https://github.com/xykt/IPQuality
+
+IPQuality is licensed under AGPL-3.0. This project does not bundle or modify the IPQuality shell script; it uses public data endpoints that the current IPQuality script itself calls, with provider/source labels shown in the UI.
