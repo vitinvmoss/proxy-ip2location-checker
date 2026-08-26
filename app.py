@@ -1,4 +1,9 @@
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from flask import Flask, render_template, request, jsonify, redirect, url_for, make_response
+from werkzeug.middleware.proxy_fix import ProxyFix
+import hmac
+import hashlib
+import time
+import secrets
 import requests
 import os
 import socket
@@ -7,8 +12,14 @@ from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', os.urandom(32))
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+SECRET = os.environ.get('FLASK_SECRET_KEY', '').strip()
+if not SECRET:
+    # Development fallback only. Render should always have FLASK_SECRET_KEY set.
+    SECRET = secrets.token_urlsafe(48)
 APP_PASSWORD = os.environ.get('APP_PASSWORD', '').strip()
+AUTH_COOKIE = 'proxy_checker_auth'
+AUTH_MAX_AGE = 60 * 60 * 24 * 30
 MAX_PROXIES = 50
 MAX_WORKERS = 10
 IP_ECHO_URL = "https://api.ipify.org?format=json"
@@ -164,13 +175,36 @@ def apply_location(result, data):
     })
 
 
+def make_auth_token():
+    # Timestamped, HMAC-signed token; no password is stored in the browser.
+    ts = str(int(time.time()))
+    sig = hmac.new(SECRET.encode(), ts.encode(), hashlib.sha256).hexdigest()
+    return f'{ts}.{sig}'
+
+
+def valid_auth_token(token):
+    try:
+        ts_s, sig = token.split('.', 1)
+        ts = int(ts_s)
+        if time.time() - ts > AUTH_MAX_AGE or ts > time.time() + 60:
+            return False
+        expected = hmac.new(SECRET.encode(), ts_s.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def is_authenticated():
+    return valid_auth_token(request.cookies.get(AUTH_COOKIE, ''))
+
+
 @app.before_request
 def require_password():
     if not APP_PASSWORD:
         return None
-    if request.endpoint in ('login', 'static'):
+    if request.endpoint in ('login', 'login_post', 'static'):
         return None
-    if session.get('authenticated'):
+    if is_authenticated():
         return None
     if request.path.startswith('/api/'):
         return jsonify({'error': 'Authentication required.'}), 401
@@ -185,16 +219,26 @@ def login():
 @app.post('/login')
 def login_post():
     password = request.form.get('password', '')
-    if password and password == APP_PASSWORD:
-        session['authenticated'] = True
-        return redirect(url_for('index'))
+    if password and hmac.compare_digest(password, APP_PASSWORD):
+        response = make_response(redirect(url_for('index')))
+        response.set_cookie(
+            AUTH_COOKIE,
+            make_auth_token(),
+            max_age=AUTH_MAX_AGE,
+            secure=True,
+            httponly=True,
+            samesite='Lax',
+            path='/',
+        )
+        return response
     return render_template('login.html', error='Incorrect password.'), 401
 
 
 @app.get('/logout')
 def logout():
-    session.clear()
-    return redirect(url_for('login'))
+    response = make_response(redirect(url_for('login')))
+    response.delete_cookie(AUTH_COOKIE, path='/')
+    return response
 
 
 @app.get('/')
