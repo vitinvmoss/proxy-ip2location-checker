@@ -11,14 +11,23 @@ APP_PASSWORD = os.environ.get('APP_PASSWORD', '').strip()
 AUTH_COOKIE = 'proxy_checker_auth'
 AUTH_MAX_AGE = 60 * 60 * 24 * 30
 MAX_PROXIES = 50
-MAX_WORKERS = 8
-PROXY_TIMEOUT = 15
+MAX_WORKERS = 6
+PROXY_TIMEOUT = 8
 IP2LOCATION_URL = 'https://api.ip2location.io/'
 IPINFO_WIDGET_URL = 'https://ipinfo.io/widget/demo/'
 IPAPI_URL = 'https://api.ipapi.is/'
 DBIP_API_URL = 'https://api.db-ip.com/v2/free/'
 DBIP_PAGE_URL = 'https://db-ip.com/'
 CHECK_PLACE_URL = 'https://ipinfo.check.place/'
+
+
+def sanitize_error(exc):
+    """Return a useful, credential-safe error message."""
+    msg = str(exc or "Unknown error")
+    # Never expose proxy usernames/passwords in the UI/log response.
+    msg = re.sub(r'(?i)(https?|socks5h?|socks4)://[^@\s]+@', r'\1://***:***@', msg)
+    msg = re.sub(r'(?i)(://)[^\s/@:]+:[^\s/@]+@', r'\1***:***@', msg)
+    return msg[:500]
 
 
 def parse_proxy(line):
@@ -56,20 +65,44 @@ def proxy_url(p, scheme):
 
 
 def detect_exit_ip(p):
+    """Find the proxy's public exit IP using several independent echo services.
+
+    A single blocked echo endpoint must never make the whole batch fail.
+    """
     schemes = [p['scheme']] if p['scheme'] else ['http', 'socks5h']
-    last = 'Proxy connection failed'
+    echo_urls = [
+        'https://api.ipify.org?format=json',
+        'https://api64.ipify.org?format=json',
+        'https://icanhazip.com/',
+        'https://ifconfig.me/ip',
+    ]
+    errors = []
     for scheme in schemes:
         try:
             u = proxy_url(p, scheme)
-            started = time.perf_counter()
-            r = requests.get('https://api.ipify.org?format=json', proxies={'http':u,'https':u}, timeout=PROXY_TIMEOUT)
-            r.raise_for_status(); ip = r.json().get('ip')
-            if ip:
-                return {'exit_ip': ip, 'proxy_type': scheme, 'response_ms': round((time.perf_counter()-started)*1000)}
-            last = 'IP echo returned no IP'
+            proxies = {'http': u, 'https': u}
+            for echo_url in echo_urls:
+                try:
+                    started = time.perf_counter()
+                    r = requests.get(
+                        echo_url, proxies=proxies, timeout=PROXY_TIMEOUT,
+                        headers={'User-Agent': 'proxy-ip-checker/4.0'},
+                    )
+                    r.raise_for_status()
+                    if 'json' in r.headers.get('content-type','').lower() or echo_url.endswith('format=json'):
+                        try: ip = r.json().get('ip')
+                        except Exception: ip = None
+                    else:
+                        ip = r.text.strip().split()[0] if r.text.strip() else None
+                    if ip and re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}', ip):
+                        return {'exit_ip': ip, 'proxy_type': scheme,
+                                'response_ms': round((time.perf_counter()-started)*1000)}
+                    errors.append(f'{scheme}/{echo_url}: no public IPv4 returned')
+                except Exception as e:
+                    errors.append(f'{scheme}/{echo_url}: {sanitize_error(e)}')
         except Exception as e:
-            last = str(e)
-    raise RuntimeError(last)
+            errors.append(f'{scheme}: {sanitize_error(e)}')
+    raise RuntimeError('Proxy connection failed. ' + ' | '.join(errors[-4:]))
 
 
 def safe_get_json(url, **kwargs):
@@ -201,7 +234,7 @@ def enrich_ip(ip):
         'IPQuality/AbuseIPDB': lambda: check_place(ip,'abuseipdb'),
         'DB-IP page': lambda: dbip_page(ip),
     }
-    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+    with ThreadPoolExecutor(max_workers=5) as ex:
         fs={ex.submit(fn):name for name,fn in jobs.items()}
         for f in as_completed(fs):
             name=fs[f]
@@ -251,7 +284,7 @@ def login_post():
 def logout():
     r=make_response(redirect(url_for('login'))); r.delete_cookie(AUTH_COOKIE,path='/'); return r
 @app.get('/healthz')
-def healthz(): return jsonify({'status':'ok','version':'v3'})
+def healthz(): return jsonify({'status':'ok','version':'v4'})
 @app.get('/')
 def index(): return render_template('index.html')
 
@@ -277,11 +310,11 @@ def check():
             ip=fs[f]
             try:
                 x=f.result(); x.setdefault('raw_present',{}); cache[ip]=x
-            except Exception as e: cache[ip]={'sources':{},'errors':{'enrichment':str(e)},'raw_present':{}}
+            except Exception as e: cache[ip]={'sources':{},'errors':{'enrichment':sanitize_error(e)},'raw_present':{}}
     for r in results:
         if r and r.get('exit_ip') in cache:
             r['enrichment']=cache[r['exit_ip']]
-    return jsonify({'results':results,'unique_ips_looked_up':len(ips),'version':'v3'})
+    return jsonify({'results':results,'unique_ips_looked_up':len(ips),'version':'v4'})
 
 def _check_one(index,line):
     p=parse_proxy(line); base={'index':index,'proxy':line,'status':'failed'}
