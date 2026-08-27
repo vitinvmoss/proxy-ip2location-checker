@@ -2565,15 +2565,9 @@ db_ipapi $2
 db_dbip
 [[ $mode_lite -eq 0 ]]&&db_ipdata $2||ipdata=()
 [[ $mode_lite -eq 0 ]]&&db_ipqs $2||ipqs=()
-MediaUnlockTest_TikTok $2
-MediaUnlockTest_DisneyPlus $2
-MediaUnlockTest_Netflix $2
-MediaUnlockTest_YouTube_Premium $2
-MediaUnlockTest_PrimeVideo_Region $2
-MediaUnlockTest_Reddit $2
-OpenAITest $2
-check_mail
-[[ $2 -eq 4 ]]&&check_dnsbl "$IP" 50
+# --- v6 focused engine: media/AI unlock, email, and DNSBL checks intentionally skipped ---
+# These accounted for the bulk of the 100-155s per-proxy runtime and are not needed
+# for a proxy IP-quality report (Info/Type/Score/Factor). See FOCUSED_ENGINE_NOTICE.txt.
 echo -ne "$Font_LineClear" 1>&2
 if [ $2 -eq 4 ]||[[ $IPV4work -eq 0 || $IPV4check -eq 0 ]];then
 for ((i=0; i<ADLines; i++));do

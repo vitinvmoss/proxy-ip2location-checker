@@ -1,0 +1,55 @@
+FOCUSED ENGINE NOTICE
+=====================
+
+ipquality/ip.sh is a patched copy of the upstream xykt/IPQuality script
+(script_version v2026-08-09, https://github.com/xykt/IPQuality).
+
+Upstream has no flag or built-in mechanism to skip the media-unlock,
+email, and DNSBL checks. Those modules are called unconditionally inside
+the check_IP() function, adding 100-155 seconds of wall-clock time per
+proxy. For a proxy IP-quality report focused on Info/Type/Score/Factor,
+those checks are not needed.
+
+WHAT THIS PATCH REMOVES
+-----------------------
+The patch removes exactly 9 call sites inside check_IP():
+
+  1. MediaUnlockTest_TikTok $2
+  2. MediaUnlockTest_DisneyPlus $2
+  3. MediaUnlockTest_Netflix $2
+  4. MediaUnlockTest_YouTube_Premium $2
+  5. MediaUnlockTest_PrimeVideo_Region $2
+  6. MediaUnlockTest_Reddit $2
+  7. OpenAITest $2
+  8. check_mail
+  9. [[ $2 -eq 4 ]] && check_dnsbl "$IP" 50
+
+Each call line is replaced with a comment block explaining the rationale.
+No other lines in the script are modified.
+
+WHAT IS NOT TOUCHED
+--------------------
+- All function definitions (MediaUnlockTest_*, OpenAITest, check_mail,
+  check_dnsbl, and every other function) remain in the script untouched.
+- All database-check functions (db_maxmind, db_ipinfo, db_scamalytics,
+  db_ipregistry, db_ipapi, db_abuseipdb, db_ip2location, db_dbip,
+  db_ipdata, db_ipqs) are fully preserved.
+- The save_json() function is untouched. Because it reads variables set
+  by the removed call sites (e.g. tiktok[ustatus], disney[ustatus],
+  netflix[ustatus], etc.) and those variables are never populated, the
+  upstream ${var:-null} fallbacks in save_json ensure that Media and Mail
+  JSON fields stay safely empty ("null") in the JSON output.
+
+RE-SYNCING WITH FUTURE UPSTREAM
+--------------------------------
+When syncing with a newer upstream ip.sh:
+
+  1. Obtain the new upstream ip.sh from https://github.com/xykt/IPQuality.
+  2. Diff against the current ipquality/ip.sh to identify changes.
+  3. In the new ip.sh, locate the check_IP() function.
+  4. Remove the same 9 call sites listed above (media unlock x6,
+     OpenAITest, check_mail, check_dnsbl).
+  5. Replace them with the three-line comment block.
+  6. Run: bash -n ipquality/ip.sh
+     (must produce no output and exit 0)
+  7. Verify the app still works end-to-end.

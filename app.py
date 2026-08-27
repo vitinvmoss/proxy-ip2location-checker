@@ -21,8 +21,9 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 COOKIE = "proxy_checker_auth"
 MAX_AGE = 30 * 24 * 3600
 MAX_PROXIES = 20
-MAX_CONCURRENT = 2
+MAX_CONCURRENT = 4
 IPQUALITY_SCRIPT = "/opt/ipquality/ip.sh"
+IPQUALITY_TIMEOUT = 60
 
 JOBS = {}
 LOCK = threading.Lock()
@@ -251,7 +252,7 @@ def run_ipquality(proxy_line):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=155,
+            timeout=IPQUALITY_TIMEOUT,
             check=False,
             env={**os.environ, "TERM": "dumb", "CI": "1"},
         )
@@ -274,7 +275,7 @@ def run_ipquality(proxy_line):
             "elapsed_ms": elapsed_ms,
         }
     except subprocess.TimeoutExpired:
-        return {"status": "failed", "error": "IPQuality timed out after 155 seconds."}
+        return {"status": "failed", "error": f"IPQuality timed out after {IPQUALITY_TIMEOUT} seconds."}
     except Exception as exc:
         return {"status": "failed", "error": sanitize_error(exc)}
 
