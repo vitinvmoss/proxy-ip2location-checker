@@ -1,0 +1,78 @@
+RELAY BLOCK NOTICE (ipinfo.check.place / lite-mode)
+====================================================
+
+STATUS: OPEN — infrastructure-level block, no code-side fix exists. Do NOT
+re-open this investigation from scratch; read this first.
+
+WHAT HAPPENS
+------------
+Every proxy check runs db_maxmind() in ipquality/ip.sh, which curls the
+script author's own relay:
+
+    curl $CurlARG -Ls -4 -m 10 "https://ipinfo.check.place/$IP?lang=en"
+
+If that response is not valid JSON (jq validation fails), the script silently
+sets mode_lite=1 and SKIPS five providers for the rest of that run:
+IP2LOCATION, SCAMALYTICS, AbuseIPDB, ipdata, IPQS. ASN/Organization/Location
+fall back to the independent ipinfo.io endpoint, which is why those fields
+still work in lite mode.
+
+ROOT CAUSE (verified 2026-08-27)
+--------------------------------
+The relay is behind Cloudflare and its WAF returns HTTP 403 "Attention
+Required" to non-browser clients from cloud/datacenter networks. Evidence:
+
+  - 28/28 curls to https://ipinfo.check.place/8.8.8.8?lang=en from two
+    independent non-Render networks returned HTTP 403 in 0.1-0.4s
+    (all 5 spaced runs, 20 rapid runs, browser-UA run, full-Chrome-header
+    run, plus an independent URL fetcher). No 200s at all -> deterministic
+    for our client class, not flaky, not a rate limit that resets.
+  - The 403 page is Cloudflare's ("server: cloudflare", cf-ray header,
+    "Attention Required! | Cloudflare" title).
+  - Adding browser User-Agent / Accept / sec-ch-ua / Referer headers does
+    NOT change the result -> the block is keyed on the TLS fingerprint
+    (curl's JA3) and/or exit-IP reputation, not headers.
+  - The relay call goes THROUGH the checked proxy (get_opts() sets
+    CurlARG="-x <proxy>", used by every curl in the script), so Cloudflare
+    judges the PROXY's exit IP, not Render's.
+  - Owner's real runs: 2/5 complete, 3/5 lite-mode (Austria residential,
+    Leeds residential, UK datacenter). Different countries/types all blocked
+    -> per-exit-IP reputation, not a Render-only or single-provider issue.
+  - check.place (302) and hits.xykt.de (200) respond fine; only the API
+    subdomains (ipinfo.check.place, upload.check.place) are WAF-blocked.
+  - Upstream xykt/IPQuality main is byte-identical here (v2026-08-09): same
+    relay, same code, no fix to sync.
+
+WHY NO CODE FIX WORKS
+---------------------
+  - Retry-with-backoff: refuted. There is no transient success to catch;
+    the block is deterministic for blocked clients.
+  - Un-gating the 5 providers when mode_lite=1: pointless. All five of them
+    (db_ip2location, db_scamalytics, db_abuseipdb, db_ipdata, db_ipqs)
+    ALSO curl the same relay (ipinfo.check.place?db=...), so they fail
+    identically.
+  - Header spoofing: tested, still 403 (TLS fingerprint is checked
+    server-side; curl cannot fake a browser JA3 without a headless browser,
+    which is absurd for this app).
+  - Changing Render egress IP / paid tier: irrelevant, because the request
+    egresses from the checked proxy, not from Render.
+
+CONCLUSION / RECOMMENDATION
+---------------------------
+Lite-mode (partial) results are the expected common case for proxies whose
+exit IPs Cloudflare flags — which, for a proxy-quality checker, is a large
+fraction of the inputs. This is outside the app's control. The app already
+handles it correctly (proxy never marked FAILED; providers shown
+"Unavailable" with "Partial: relay unreachable" explanation).
+
+Optional, cosmetic-only improvement if desired: app.py's lite_mode_reason
+text says the relay "was unreachable" — "Cloudflare's WAF on the relay
+rejected this proxy's exit IP (HTTP 403)" is more accurate. Not worth a
+deploy on its own; fold into the next real change.
+
+If the relay ever starts passing again (author may adjust WAF rules), the
+lite-mode rate will drop on its own; the detection code will just report
+"complete" again. Re-check with:
+    curl -s -o /dev/null -w "%{http_code}\n" --max-time 10 \
+      "https://ipinfo.check.place/8.8.8.8?lang=en"
+from any cloud/datacenter network — a 200 means the block has been lifted.
