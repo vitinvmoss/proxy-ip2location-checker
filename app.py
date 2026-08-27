@@ -344,6 +344,19 @@ def summarize(data):
         "robot": {k: normalize_value(v) for k, v in factor_robot.items()},
     }
 
+    # IPQuality silently drops into "lite mode" when its own relay
+    # (ipinfo.check.place) fails on the very first lookup. In lite mode it
+    # skips IP2Location, Scamalytics, AbuseIPDB, ipdata, and IPQS as a group
+    # — with no flag anywhere in the JSON saying so. Detect that pattern here
+    # so the UI can say why those fields are empty instead of leaving silent
+    # blanks, per the "no false data / no mystery blanks" requirement.
+    lite_mode_providers = ["IP2LOCATION", "SCAMALYTICS", "AbuseIPDB", "ipdata", "IPQS"]
+    lite_mode_detected = all(
+        score_values.get(p) is None
+        and all((factors[f].get(p) is None) for f in ("proxy", "tor", "vpn", "server", "abuser", "robot"))
+        for p in lite_mode_providers
+    )
+
     return {
         "ip": normalize_value(head.get("IP")),
         "asn": normalize_value(info.get("ASN")),
@@ -369,7 +382,18 @@ def summarize(data):
             "scores": "IPQuality: IP2Location / Scamalytics / ipapi / AbuseIPDB / IPQS / DB-IP",
             "factors": "IPQuality: IP2Location / ipapi / ipregistry / IPQS / Scamalytics / ipdata / IPinfo / IPWHOIS / DB-IP",
         },
+        "lite_mode": lite_mode_detected,
+        "lite_mode_reason": (
+            "IPQuality's basic-info relay (ipinfo.check.place) was unreachable "
+            "for this proxy's request, so the engine skipped IP2Location, "
+            "Scamalytics, AbuseIPDB, ipdata, and IPQS for this run. ASN, "
+            "Organization, and Location still came through via an independent "
+            "fallback source (IPinfo) and remain reliable."
+        ) if lite_mode_detected else None,
     }
+
+
+LITE_MODE_PROVIDERS = {"IP2LOCATION", "SCAMALYTICS", "AbuseIPDB", "ipdata", "IPQS"}
 
 
 def provider_table(summary):
@@ -377,10 +401,12 @@ def provider_table(summary):
     company = summary.get("company") or {}
     scores = summary.get("scores") or {}
     factors = summary.get("factors") or {}
+    lite_mode = summary.get("lite_mode", False)
 
     order = ["IPinfo", "ipregistry", "ipapi", "AbuseIPDB", "IP2LOCATION", "SCAMALYTICS", "IPQS", "DBIP", "ipdata", "IPWHOIS"]
     providers = {}
     for name in order:
+        skipped = lite_mode and name in LITE_MODE_PROVIDERS
         providers[name] = {
             "usage": usage.get(name),
             "company": company.get(name),
@@ -393,6 +419,7 @@ def provider_table(summary):
             "server": (factors.get("server") or {}).get(name),
             "abuser": (factors.get("abuser") or {}).get(name),
             "robot": (factors.get("robot") or {}).get(name),
+            "status": "skipped_relay_unavailable" if skipped else "ok",
         }
     return providers
 
@@ -416,13 +443,20 @@ def worker(job_id, lines):
                 result = {"status": "failed", "error": sanitize_error(exc)}
 
             summary = summarize(result.get("data")) if result.get("data") else None
+            ipquality_status = None
             if summary:
                 summary["providers"] = provider_table(summary)
+                # Distinguish "the proxy worked and every provider answered" from
+                # "the proxy worked but some providers were skipped" (this repo's
+                # State C vs State D). A proxy is never marked FAILED just
+                # because a provider group was unavailable.
+                ipquality_status = "partial" if summary.get("lite_mode") else "complete"
 
             result.update({
                 "index": idx,
                 "proxy": line,
                 "summary": summary,
+                "ipquality_status": ipquality_status,
             })
 
             with LOCK:
