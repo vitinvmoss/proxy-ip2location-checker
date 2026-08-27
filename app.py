@@ -384,11 +384,13 @@ def summarize(data):
         },
         "lite_mode": lite_mode_detected,
         "lite_mode_reason": (
-            "IPQuality's basic-info relay (ipinfo.check.place) was unreachable "
-            "for this proxy's request, so the engine skipped IP2Location, "
-            "Scamalytics, AbuseIPDB, ipdata, and IPQS for this run. ASN, "
-            "Organization, and Location still came through via an independent "
-            "fallback source (IPinfo) and remain reliable."
+            "IPQuality's basic-info relay (ipinfo.check.place) is behind a "
+            "Cloudflare WAF that rejected this proxy's exit IP (HTTP 403), so "
+            "the engine skipped IP2Location, Scamalytics, AbuseIPDB, ipdata, "
+            "and IPQS for this run. ASN, Organization, and Location still came "
+            "through via an independent fallback source (IPinfo) and remain "
+            "reliable. This is an infrastructure block on the relay's side, "
+            "not a bug — see RELAY_BLOCK_NOTICE.txt."
         ) if lite_mode_detected else None,
     }
 
