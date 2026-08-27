@@ -1,184 +1,490 @@
 from flask import Flask, render_template, request, jsonify, redirect, url_for, make_response
 from werkzeug.middleware.proxy_fix import ProxyFix
-import os, time, hmac, hashlib, secrets, re, subprocess, tempfile, threading, uuid, json, urllib.parse
+import os
+import time
+import hmac
+import hashlib
+import secrets
+import re
+import subprocess
+import threading
+import uuid
+import json
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
-SECRET = os.environ.get('FLASK_SECRET_KEY','').strip() or secrets.token_urlsafe(48)
-APP_PASSWORD = os.environ.get('APP_PASSWORD','').strip()
-COOKIE='proxy_checker_auth'; MAX_AGE=30*24*3600
-JOBS={}; LOCK=threading.Lock()
-MAX_PROXIES=20
-IPQUALITY_URL=os.environ.get('IPQUALITY_URL','https://IP.Check.Place').strip()
+
+SECRET = os.environ.get("FLASK_SECRET_KEY", "").strip() or secrets.token_urlsafe(48)
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
+COOKIE = "proxy_checker_auth"
+MAX_AGE = 30 * 24 * 3600
+MAX_PROXIES = 20
+MAX_CONCURRENT = 2
+IPQUALITY_SCRIPT = "/opt/ipquality/ip.sh"
+
+JOBS = {}
+LOCK = threading.Lock()
 
 
 def token():
-    t=str(int(time.time())); s=hmac.new(SECRET.encode(),t.encode(),hashlib.sha256).hexdigest(); return t+'.'+s
+    t = str(int(time.time()))
+    sig = hmac.new(SECRET.encode(), t.encode(), hashlib.sha256).hexdigest()
+    return f"{t}.{sig}"
 
-def valid_token(v):
+
+def valid_token(value):
     try:
-        t,s=v.split('.',1); ts=int(t)
-        if abs(time.time()-ts)>MAX_AGE:return False
-        return hmac.compare_digest(s,hmac.new(SECRET.encode(),t.encode(),hashlib.sha256).hexdigest())
-    except:return False
+        ts_s, sig = value.split(".", 1)
+        ts = int(ts_s)
+        if abs(time.time() - ts) > MAX_AGE:
+            return False
+        expected = hmac.new(SECRET.encode(), ts_s.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, expected)
+    except Exception:
+        return False
 
-def auth(): return valid_token(request.cookies.get(COOKIE,''))
+
+def authenticated():
+    return valid_token(request.cookies.get(COOKIE, ""))
+
+
 @app.before_request
 def gate():
-    if not APP_PASSWORD or request.endpoint in ('login','login_post','static','healthz'): return
-    if auth(): return
-    if request.path.startswith('/api/'): return jsonify(error='Authentication required.'),401
-    return redirect(url_for('login'))
-@app.get('/healthz')
-def healthz(): return 'ok',200
-@app.get('/login')
-def login(): return render_template('login.html')
-@app.post('/login')
+    if not APP_PASSWORD or request.endpoint in {"login", "login_post", "static", "healthz"}:
+        return None
+    if authenticated():
+        return None
+    if request.path.startswith("/api/"):
+        return jsonify(error="Authentication required."), 401
+    return redirect(url_for("login"))
+
+
+@app.get("/healthz")
+def healthz():
+    return "ok", 200
+
+
+@app.get("/login")
+def login():
+    return render_template("login.html")
+
+
+@app.post("/login")
 def login_post():
-    if hmac.compare_digest(request.form.get('password',''),APP_PASSWORD):
-        r=make_response(redirect('/')); r.set_cookie(COOKIE,token(),max_age=MAX_AGE,secure=True,httponly=True,samesite='Lax',path='/'); return r
-    return render_template('login.html',error='Incorrect password.'),401
-@app.get('/logout')
+    if hmac.compare_digest(request.form.get("password", ""), APP_PASSWORD):
+        response = make_response(redirect("/"))
+        response.set_cookie(
+            COOKIE,
+            token(),
+            max_age=MAX_AGE,
+            secure=True,
+            httponly=True,
+            samesite="Lax",
+            path="/",
+        )
+        return response
+    return render_template("login.html", error="Incorrect password."), 401
+
+
+@app.get("/logout")
 def logout():
-    r=make_response(redirect('/')); r.delete_cookie(COOKIE,path='/'); return r
-@app.get('/')
-def index(): return render_template('index.html')
+    response = make_response(redirect("/login"))
+    response.delete_cookie(COOKIE, path="/")
+    return response
+
+
+@app.get("/")
+def index():
+    return render_template("index.html")
 
 
 def parse_proxy(line):
-    line=line.strip();
-    if not line:return None
-    scheme='http'; body=line
-    m=re.match(r'^(https?|socks5h?|socks4)://(.+)$',line,re.I)
-    if m: scheme=m.group(1).lower(); body=m.group(2)
-    if '@' not in body:
-        p=body.split(':')
-        if len(p)<4:return None
-        host,port=user=None,None,None
-        host=':'.join(p[:-3]); port=p[-3]; user=p[-2]; pwd=p[-1]
-    else:
-        cred,hp=body.rsplit('@',1); user,pwd=(cred.split(':',1)+[''])[:2] if ':' in cred else (cred,'')
-        if hp.startswith('['):
-            e=hp.find(']'); host=hp[1:e]; port=hp[e+2:]
-        else: host,port=hp.rsplit(':',1)
-    try: port=int(port); assert 1<=port<=65535
-    except:return None
-    return dict(raw=line,scheme=scheme,host=host,port=port,user=user,pwd=pwd)
+    """Accept the common forms used by proxy providers.
 
-def proxy_url(p):
-    host=p['host'];
-    if ':' in host and not host.startswith('['): host='['+host+']'
-    return f"{p['scheme']}://{urllib.parse.quote(p['user'],safe='')}:{urllib.parse.quote(p['pwd'],safe='')}@{host}:{p['port']}"
+    Supported:
+      host:port:username:password
+      username:password:host:port
+      http://username:password@host:port
+      https://username:password@host:port
+      socks5://username:password@host:port
+      socks5h://username:password@host:port
+      socks4://username:password@host:port
 
-def sanitize(s):
-    s=str(s or '')
-    s=re.sub(r'(?i)(https?|socks5h?|socks4)://[^\s/@:]+:[^\s/@]+@',r'\1://***:***@',s)
-    s=re.sub(r'(?i)(proxy[^\s]*)',lambda m:m.group(0),s)
-    return s[-1800:]
+    The parser identifies the port by checking the numeric field instead of
+    assuming one specific four-field ordering.
+    """
+    line = line.strip()
+    if not line:
+        return None, "Empty proxy line."
 
-def run_ipquality(proxy):
-    p=parse_proxy(proxy)
-    if not p: return {'status':'failed','error':'Invalid format. Use host:port:username:password.'}
-    url=proxy_url(p)
-    with tempfile.NamedTemporaryFile(prefix='ipq_',suffix='.json',delete=False) as f: out=f.name
+    scheme = "http"
+    body = line
+    m = re.match(r"^(https?|socks5h?|socks4)://(.+)$", line, re.IGNORECASE)
+    if m:
+        scheme = m.group(1).lower()
+        body = m.group(2)
+
+    # URL-style: user:pass@host:port
+    if "@" in body:
+        creds, hostport = body.rsplit("@", 1)
+        if ":" not in creds:
+            return None, "URL-style proxy is missing username/password."
+        username, password = creds.split(":", 1)
+        host, port_text = _split_host_port(hostport)
+        if host is None:
+            return None, "Invalid host:port portion."
+        return _make_proxy(line, scheme, host, port_text, username, password)
+
+    # Provider-style forms. Do not unpack the whole split list blindly.
+    parts = body.split(":")
+    if len(parts) != 4:
+        return None, "Expected host:port:username:password (or username:password:host:port)."
+
+    # host:port:user:pass
+    if _valid_port_text(parts[1]):
+        host, port_text, username, password = parts
+        return _make_proxy(line, scheme, host, port_text, username, password)
+
+    # user:pass:host:port
+    if _valid_port_text(parts[3]):
+        username, password, host, port_text = parts
+        return _make_proxy(line, scheme, host, port_text, username, password)
+
+    return None, "Could not identify the port; accepted 4-field formats are host:port:user:pass or user:pass:host:port."
+
+
+def _split_host_port(hostport):
+    if hostport.startswith("["):
+        end = hostport.find("]")
+        if end == -1 or end + 1 >= len(hostport) or hostport[end + 1] != ":":
+            return None, None
+        return hostport[1:end], hostport[end + 2 :]
+    if ":" not in hostport:
+        return None, None
+    return hostport.rsplit(":", 1)
+
+
+def _valid_port_text(value):
     try:
-        # Exact upstream IPQuality script, with full IP, English, JSON and privacy mode.
-        # Dependencies are preinstalled in the Docker image, so -n skips install prompts.
-        cmd=['bash','/opt/ipquality/ip.sh','-E','-4','-f','-j','-n','-p','-x',url,'-o',out]
-        cp=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=150,check=False,env={**os.environ,'TERM':'dumb'})
-        raw=''
-        try: raw=open(out,'r',encoding='utf-8',errors='replace').read().strip()
-        except: pass
-        data=None
-        # JSON file is authoritative; fall back to the last valid JSON-looking stdout line.
-        try:data=json.loads(raw)
-        except:
-            for line in reversed(cp.stdout.splitlines()):
-                line=line.strip()
-                if line.startswith('{') and line.endswith('}'):
-                    try:data=json.loads(line);break
-                    except:pass
+        port = int(value)
+        return 1 <= port <= 65535
+    except (TypeError, ValueError):
+        return False
+
+
+def _make_proxy(raw, scheme, host, port_text, username, password):
+    if not host or not username:
+        return None, "Host and username are required."
+    if not _valid_port_text(port_text):
+        return None, "Invalid port."
+    return {
+        "raw": raw,
+        "scheme": scheme,
+        "host": host,
+        "port": int(port_text),
+        "user": username,
+        "pwd": password,
+    }, None
+
+
+def proxy_url(proxy):
+    host = proxy["host"]
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    user = urllib.parse.quote(proxy["user"], safe="")
+    pwd = urllib.parse.quote(proxy["pwd"], safe="")
+    return f"{proxy['scheme']}://{user}:{pwd}@{host}:{proxy['port']}"
+
+
+def sanitize_error(value):
+    """Keep errors useful without leaking proxy credentials."""
+    text = str(value or "")
+    text = re.sub(r"(?i)(https?|socks5h?|socks4)://[^\s/@:]+:[^\s/@]+@", r"\1://***:***@", text)
+    text = re.sub(r"(?i)(https?|socks5h?|socks4)://[^\s/]+", r"\1://***@***", text)
+    return text[-2000:]
+
+
+def extract_last_json(stdout):
+    """IPQuality -j emits its final JSON to stdout; other progress/ad text is stderr."""
+    text = (stdout or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def run_ipquality(proxy_line):
+    proxy, parse_error = parse_proxy(proxy_line)
+    if not proxy:
+        return {"status": "failed", "error": parse_error or "Invalid proxy."}
+
+    command = [
+        "bash",
+        IPQUALITY_SCRIPT,
+        "-E",
+        "-4",
+        "-f",
+        "-j",
+        "-n",
+        "-p",
+        "-x",
+        proxy_url(proxy),
+    ]
+
+    try:
+        started = time.perf_counter()
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=155,
+            check=False,
+            env={**os.environ, "TERM": "dumb", "CI": "1"},
+        )
+        elapsed_ms = round((time.perf_counter() - started) * 1000)
+        data = extract_last_json(completed.stdout)
+
         if not data:
-            return {'status':'failed','error':sanitize(cp.stderr or cp.stdout or 'IPQuality returned no JSON.'),'returncode':cp.returncode}
-        return {'status':'online','data':data,'returncode':cp.returncode}
+            error = sanitize_error(completed.stderr or completed.stdout or "IPQuality returned no JSON.")
+            return {
+                "status": "failed",
+                "error": error,
+                "returncode": completed.returncode,
+                "elapsed_ms": elapsed_ms,
+            }
+
+        return {
+            "status": "online",
+            "data": data,
+            "returncode": completed.returncode,
+            "elapsed_ms": elapsed_ms,
+        }
     except subprocess.TimeoutExpired:
-        return {'status':'failed','error':'IPQuality timed out after 150 seconds.'}
-    except Exception as e:return {'status':'failed','error':sanitize(e)}
-    finally:
-        try: os.unlink(out)
-        except: pass
+        return {"status": "failed", "error": "IPQuality timed out after 155 seconds."}
+    except Exception as exc:
+        return {"status": "failed", "error": sanitize_error(exc)}
 
-def walk(obj,path=''):
-    if isinstance(obj,dict):
-        for k,v in obj.items(): yield from walk(v,(path+'.'+k).strip('.'))
-    elif isinstance(obj,list):
-        for i,v in enumerate(obj): yield from walk(v,f'{path}[{i}]')
-    else: yield path,obj
 
-def find_fields(data):
-    flat=list(walk(data)); result={}
-    keys=['ip','asn','organization','city','country','countrycode','timezone','proxy','tor','vpn','server','abuser','robot','score','risk','usage','usetype','comtype','company','isp','fraud','abuser_score']
-    for k in keys:
-        vals=[(p,v) for p,v in flat if p.lower().endswith('.'+k) or p.lower()==k]
-        if vals: result[k]=vals
-    return result
+def normalize_value(value):
+    if value in (None, "", "null"):
+        return None
+    return value
+
+
+def risk_from_score(value, provider):
+    if value is None:
+        return None
+    try:
+        score = float(str(value).replace("%", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+    # These thresholds match the upstream script's score bands closely.
+    if provider.lower() == "scamalytics":
+        return "VeryHigh" if score >= 100 else "High" if score >= 60 else "Medium" if score >= 20 else "Low"
+    if provider.lower() == "ip2location":
+        return "VeryHigh" if score >= 99 else "High" if score >= 66 else "Medium" if score >= 33 else "Low"
+    if provider.lower() == "abuseipdb":
+        return "VeryHigh" if score >= 100 else "High" if score >= 25 else "Low"
+    if provider.lower() == "dbip":
+        return "VeryHigh" if score >= 100 else "High" if score >= 66 else "Medium" if score >= 33 else "Low"
+    if provider.lower() == "ipqs":
+        return "VeryHigh" if score >= 100 else "High" if score >= 85 else "Medium" if score >= 75 else "Low"
+    return None
+
 
 def summarize(data):
-    f=find_fields(data)
-    # Preserve exact upstream JSON and provide a useful normalized summary.
-    def first(k):
-        vals=f.get(k,[])
-        return vals[0][1] if vals else None
-    return {'ip':first('ip'),'asn':first('asn'),'organization':first('organization'),'city':first('city'),'country':first('country'),'countrycode':first('countrycode'),'timezone':first('timezone'),'proxy':first('proxy'),'tor':first('tor'),'vpn':first('vpn'),'server':first('server'),'abuser':first('abuser'),'robot':first('robot'),'score':first('score'),'risk':first('risk'),'usage':first('usage'),'raw_fields':f}
+    """Read IPQuality's real JSON schema instead of searching leaf keys generically."""
+    if not isinstance(data, dict):
+        return {}
 
-def worker(job_id,lines):
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    head = data.get("Head") or {}
+    info = data.get("Info") or {}
+    city = info.get("City") or {}
+    region = info.get("Region") or {}
+    typ = data.get("Type") or {}
+    usage = typ.get("Usage") or {}
+    company = typ.get("Company") or {}
+    score = data.get("Score") or {}
+    factor = data.get("Factor") or {}
+    factor_cc = factor.get("CountryCode") or {}
+    factor_proxy = factor.get("Proxy") or {}
+    factor_tor = factor.get("Tor") or {}
+    factor_vpn = factor.get("VPN") or {}
+    factor_server = factor.get("Server") or {}
+    factor_abuser = factor.get("Abuser") or {}
+    factor_robot = factor.get("Robot") or {}
+
+    usage_values = {k: normalize_value(v) for k, v in usage.items() if normalize_value(v) is not None}
+    company_values = {k: normalize_value(v) for k, v in company.items() if normalize_value(v) is not None}
+    score_values = {k: normalize_value(v) for k, v in score.items() if normalize_value(v) is not None}
+
+    factors = {
+        "country_code": {k: normalize_value(v) for k, v in factor_cc.items()},
+        "proxy": {k: normalize_value(v) for k, v in factor_proxy.items()},
+        "tor": {k: normalize_value(v) for k, v in factor_tor.items()},
+        "vpn": {k: normalize_value(v) for k, v in factor_vpn.items()},
+        "server": {k: normalize_value(v) for k, v in factor_server.items()},
+        "abuser": {k: normalize_value(v) for k, v in factor_abuser.items()},
+        "robot": {k: normalize_value(v) for k, v in factor_robot.items()},
+    }
+
+    return {
+        "ip": normalize_value(head.get("IP")),
+        "asn": normalize_value(info.get("ASN")),
+        "organization": normalize_value(info.get("Organization")),
+        "latitude": normalize_value(info.get("Latitude")),
+        "longitude": normalize_value(info.get("Longitude")),
+        "city": normalize_value(city.get("Name")),
+        "postal_code": normalize_value(city.get("PostalCode")),
+        "subdivision": normalize_value(city.get("Subdivisions")),
+        "region": normalize_value(region.get("Name")),
+        "country_code": normalize_value(region.get("Code")),
+        "country": normalize_value(region.get("Name")),
+        "timezone": normalize_value(info.get("TimeZone")),
+        "ip_type": normalize_value(info.get("Type")),
+        "usage": usage_values,
+        "company": company_values,
+        "scores": score_values,
+        "factors": factors,
+        "version": normalize_value(head.get("Version")),
+        "sources": {
+            "basic": "MaxMind/IPinfo (from IPQuality)",
+            "usage": "IPQuality: IPinfo / ipregistry / ipapi / AbuseIPDB / IP2Location",
+            "scores": "IPQuality: IP2Location / Scamalytics / ipapi / AbuseIPDB / IPQS / DB-IP",
+            "factors": "IPQuality: IP2Location / ipapi / ipregistry / IPQS / Scamalytics / ipdata / IPinfo / IPWHOIS / DB-IP",
+        },
+    }
+
+
+def provider_table(summary):
+    usage = summary.get("usage") or {}
+    company = summary.get("company") or {}
+    scores = summary.get("scores") or {}
+    factors = summary.get("factors") or {}
+
+    order = ["IPinfo", "ipregistry", "ipapi", "AbuseIPDB", "IP2LOCATION", "SCAMALYTICS", "IPQS", "DBIP", "ipdata", "IPWHOIS"]
+    providers = {}
+    for name in order:
+        providers[name] = {
+            "usage": usage.get(name),
+            "company": company.get(name),
+            "score": scores.get(name),
+            "risk": risk_from_score(scores.get(name), name),
+            "country_code": (factors.get("country_code") or {}).get(name),
+            "proxy": (factors.get("proxy") or {}).get(name),
+            "tor": (factors.get("tor") or {}).get(name),
+            "vpn": (factors.get("vpn") or {}).get(name),
+            "server": (factors.get("server") or {}).get(name),
+            "abuser": (factors.get("abuser") or {}).get(name),
+            "robot": (factors.get("robot") or {}).get(name),
+        }
+    return providers
+
+
+def worker(job_id, lines):
     with LOCK:
-        JOBS[job_id]['status']='running'
-        JOBS[job_id]['results']=[None]*len(lines)
-    completed=0
-    # Keep concurrency deliberately low: IPQuality itself performs many outbound checks.
-    # Two concurrent runs are faster for small batches without turning one Render Free
-    # instance into a connection storm.
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        futs={ex.submit(run_ipquality,line):(i,line) for i,line in enumerate(lines)}
-        for f in as_completed(futs):
-            i,line=futs[f]
+        JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["results"] = [None] * len(lines)
+
+    completed_count = 0
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as executor:
+        future_map = {
+            executor.submit(run_ipquality, line): (idx, line)
+            for idx, line in enumerate(lines)
+        }
+        for future in as_completed(future_map):
+            idx, line = future_map[future]
             try:
-                r=f.result()
-            except Exception as e:
-                r={'status':'failed','error':sanitize(e)}
-            r['index']=i; r['proxy']=line; r['summary']=summarize(r['data']) if r.get('data') else None
-            with LOCK:
-                JOBS[job_id]['results'][i]=r
-                completed += 1
-                JOBS[job_id]['completed']=completed
-    with LOCK: JOBS[job_id]['status']='done'
+                result = future.result()
+            except Exception as exc:
+                result = {"status": "failed", "error": sanitize_error(exc)}
 
-@app.post('/api/start')
-def start():
-    payload=request.get_json(silent=True) or {}; text=payload.get('text','')
-    lines=[]; seen=set()
-    for x in text.splitlines():
-        x=x.strip()
-        if x and x not in seen: seen.add(x); lines.append(x)
-    if not lines:return jsonify(error='Paste at least one proxy.'),400
-    if len(lines)>MAX_PROXIES:return jsonify(error=f'Maximum {MAX_PROXIES} proxies per run.'),400
-    jid=uuid.uuid4().hex
-    with LOCK: JOBS[jid]={'status':'queued','results':[],'completed':0,'total':len(lines),'created':time.time()}
-    threading.Thread(target=worker,args=(jid,lines),daemon=True).start()
-    return jsonify(job_id=jid,total=len(lines))
-@app.get('/api/job/<jid>')
-def job(jid):
-    with LOCK: j=JOBS.get(jid)
-    if not j:return jsonify(error='Job not found.'),404
-    return jsonify(j)
-@app.post('/api/clear')
-def clear():
-    now=time.time()
+            summary = summarize(result.get("data")) if result.get("data") else None
+            if summary:
+                summary["providers"] = provider_table(summary)
+
+            result.update({
+                "index": idx,
+                "proxy": line,
+                "summary": summary,
+            })
+
+            with LOCK:
+                JOBS[job_id]["results"][idx] = result
+                completed_count += 1
+                JOBS[job_id]["completed"] = completed_count
+
     with LOCK:
-        for k in list(JOBS):
-            if now-JOBS[k]['created']>3600: JOBS.pop(k,None)
+        JOBS[job_id]["status"] = "done"
+
+
+@app.post("/api/start")
+def start_job():
+    payload = request.get_json(silent=True) or {}
+    text = payload.get("text", "")
+    if not isinstance(text, str):
+        return jsonify(error="Invalid proxy list."), 400
+
+    lines = []
+    seen = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line and line not in seen:
+            seen.add(line)
+            lines.append(line)
+
+    if not lines:
+        return jsonify(error="Paste at least one proxy."), 400
+    if len(lines) > MAX_PROXIES:
+        return jsonify(error=f"Maximum {MAX_PROXIES} proxies per run."), 400
+
+    job_id = uuid.uuid4().hex
+    with LOCK:
+        JOBS[job_id] = {
+            "status": "queued",
+            "results": [],
+            "completed": 0,
+            "total": len(lines),
+            "created": time.time(),
+        }
+
+    threading.Thread(target=worker, args=(job_id, lines), daemon=True).start()
+    return jsonify(job_id=job_id, total=len(lines))
+
+
+@app.get("/api/job/<job_id>")
+def get_job(job_id):
+    with LOCK:
+        job = JOBS.get(job_id)
+    if not job:
+        return jsonify(error="Job not found."), 404
+    return jsonify(job)
+
+
+@app.post("/api/clear")
+def clear_jobs():
+    cutoff = time.time() - 3600
+    with LOCK:
+        for job_id in list(JOBS):
+            if JOBS[job_id].get("created", 0) < cutoff:
+                JOBS.pop(job_id, None)
     return jsonify(ok=True)
 
-if __name__=='__main__': app.run(host='0.0.0.0',port=int(os.environ.get('PORT','5000')))
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
