@@ -560,7 +560,7 @@ local response
 IPV4=""
 local API_NET=("ipinfo.io/ip" "myip.check.place" "ip.sb" "ping0.cc" "icanhazip.com" "api64.ipify.org" "ifconfig.co" "ident.me")
 for p in "${API_NET[@]}";do
-response=$(curl $CurlARG -s4 --max-time 2 "$p")
+response=$(curl $CurlARG -s4 --max-time 6 "$p")
 if [[ $? -eq 0 && $response =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]];then
 IPV4="$response"
 break
@@ -600,7 +600,7 @@ local response
 IPV6=""
 local API_NET=("myip.check.place" "ip.sb" "ping0.cc" "icanhazip.com" "api64.ipify.org" "ifconfig.co" "ident.me")
 for p in "${API_NET[@]}";do
-response=$(curl $CurlARG -s6k --max-time 2 "$p")
+response=$(curl $CurlARG -s6k --max-time 6 "$p")
 response="${response%$'\n'}"
 if [[ $? -eq 0 && $response =~ ^[0-9a-fA-F:]+$ && $response == *:* ]];then
 IPV6="$response"
