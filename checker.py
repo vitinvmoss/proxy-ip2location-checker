@@ -365,13 +365,18 @@ def check_proxy(proxy_line, exit_ip=None):
         scam, scam_err = f_scam.result()
         ip2, ip2_err = f_ip2.result()
 
+    ip2_score = ip2.get("fraud_score") if ip2 else None
+    ip2_proxy = ip2.get("is_proxy") if ip2 else None
+
     summary = {
         "ip": exit_ip,
-        "asn": ipinfo.get("asn") if ipinfo else (f"AS{ip2['asn']}" if ip2.get("asn") else None),
+        "asn": (ipinfo.get("asn") if ipinfo else None)
+        or (f"AS{ip2['asn']}" if ip2 and ip2.get("asn") else None),
         "organization": (ipinfo.get("organization") if ipinfo else None)
-        or ip2.get("isp")
-        or ip2.get("as_name"),
-        "company": (ipinfo.get("company") if ipinfo else None) or ip2.get("isp"),
+        or (ip2.get("isp") if ip2 else None)
+        or (ip2.get("as_name") if ip2 else None),
+        "company": (ipinfo.get("company") if ipinfo else None)
+        or (ip2.get("isp") if ip2 else None),
         "country": ipinfo.get("country") if ipinfo else None,
         "country_code": ipinfo.get("country_code") if ipinfo else None,
         "region": ipinfo.get("region") if ipinfo else None,
@@ -392,8 +397,6 @@ def check_proxy(proxy_line, exit_ip=None):
         summary["anonymization"] = ipinfo.get("anonymization")
         summary["anycast"] = ipinfo.get("anycast")
 
-    ip2_score = ip2.get("fraud_score")
-    ip2_proxy = ip2.get("is_proxy")
     summary["scores"] = {
         "SCAMALYTICS": scam.get("score") if scam else None,
         "IP2LOCATION": ip2_score,
@@ -405,10 +408,10 @@ def check_proxy(proxy_line, exit_ip=None):
         },
     }
     summary["ip2location"] = {
-        "proxy_type": ip2.get("proxy_type"),
-        "usage_type": ip2.get("usage_type"),
-        "threat": ip2.get("threat"),
-        "domain": ip2.get("domain"),
+        "proxy_type": ip2.get("proxy_type") if ip2 else None,
+        "usage_type": ip2.get("usage_type") if ip2 else None,
+        "threat": ip2.get("threat") if ip2 else None,
+        "domain": ip2.get("domain") if ip2 else None,
     }
     # The UI's usage column reads summary["usage"][<provider>] by priority;
     # surface the IP type there (e.g. "Residential", "Data Center").
@@ -438,8 +441,8 @@ def check_proxy(proxy_line, exit_ip=None):
             "ok" if ip2 else "unavailable",
             score=ip2_score,
             proxy=ip2_proxy,
-            proxy_type=ip2.get("proxy_type"),
-            usage_type=ip2.get("usage_type"),
+            proxy_type=ip2.get("proxy_type") if ip2 else None,
+            usage_type=ip2.get("usage_type") if ip2 else None,
             error=ip2_err,
         ),
     }
