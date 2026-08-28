@@ -5,13 +5,12 @@ import time
 import hmac
 import hashlib
 import secrets
-import re
-import subprocess
 import threading
+import copy
 import uuid
-import json
-import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from checker import check_proxy, detect_exit_ip, parse_proxy, proxy_url, sanitize_error
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -22,8 +21,7 @@ COOKIE = "proxy_checker_auth"
 MAX_AGE = 30 * 24 * 3600
 MAX_PROXIES = 20
 MAX_CONCURRENT = 4
-IPQUALITY_SCRIPT = "/opt/ipquality/ip.sh"
-IPQUALITY_TIMEOUT = 120
+DETECT_TIMEOUT = 12
 
 JOBS = {}
 LOCK = threading.Lock()
@@ -101,373 +99,127 @@ def index():
     return render_template("index.html")
 
 
-def parse_proxy(line):
-    """Accept the common forms used by proxy providers.
-
-    Supported:
-      host:port:username:password
-      username:password:host:port
-      http://username:password@host:port
-      https://username:password@host:port
-      socks5://username:password@host:port
-      socks5h://username:password@host:port
-      socks4://username:password@host:port
-
-    The parser identifies the port by checking the numeric field instead of
-    assuming one specific four-field ordering.
-    """
-    line = line.strip()
-    if not line:
-        return None, "Empty proxy line."
-
-    scheme = "http"
-    body = line
-    m = re.match(r"^(https?|socks5h?|socks4)://(.+)$", line, re.IGNORECASE)
-    if m:
-        scheme = m.group(1).lower()
-        body = m.group(2)
-
-    # URL-style: user:pass@host:port
-    if "@" in body:
-        creds, hostport = body.rsplit("@", 1)
-        if ":" not in creds:
-            return None, "URL-style proxy is missing username/password."
-        username, password = creds.split(":", 1)
-        host, port_text = _split_host_port(hostport)
-        if host is None:
-            return None, "Invalid host:port portion."
-        return _make_proxy(line, scheme, host, port_text, username, password)
-
-    # Provider-style forms. Do not unpack the whole split list blindly.
-    parts = body.split(":")
-    if len(parts) != 4:
-        return None, "Expected host:port:username:password (or username:password:host:port)."
-
-    # host:port:user:pass
-    if _valid_port_text(parts[1]):
-        host, port_text, username, password = parts
-        return _make_proxy(line, scheme, host, port_text, username, password)
-
-    # user:pass:host:port
-    if _valid_port_text(parts[3]):
-        username, password, host, port_text = parts
-        return _make_proxy(line, scheme, host, port_text, username, password)
-
-    return None, "Could not identify the port; accepted 4-field formats are host:port:user:pass or user:pass:host:port."
-
-
-def _split_host_port(hostport):
-    if hostport.startswith("["):
-        end = hostport.find("]")
-        if end == -1 or end + 1 >= len(hostport) or hostport[end + 1] != ":":
-            return None, None
-        return hostport[1:end], hostport[end + 2 :]
-    if ":" not in hostport:
-        return None, None
-    return hostport.rsplit(":", 1)
-
-
-def _valid_port_text(value):
-    try:
-        port = int(value)
-        return 1 <= port <= 65535
-    except (TypeError, ValueError):
-        return False
-
-
-def _make_proxy(raw, scheme, host, port_text, username, password):
-    if not host or not username:
-        return None, "Host and username are required."
-    if not _valid_port_text(port_text):
-        return None, "Invalid port."
-    return {
-        "raw": raw,
-        "scheme": scheme,
-        "host": host,
-        "port": int(port_text),
-        "user": username,
-        "pwd": password,
-    }, None
-
-
-def proxy_url(proxy):
-    host = proxy["host"]
-    if ":" in host and not host.startswith("["):
-        host = f"[{host}]"
-    user = urllib.parse.quote(proxy["user"], safe="")
-    pwd = urllib.parse.quote(proxy["pwd"], safe="")
-    return f"{proxy['scheme']}://{user}:{pwd}@{host}:{proxy['port']}"
-
-
-def sanitize_error(value):
-    """Keep errors useful without leaking proxy credentials."""
-    text = str(value or "")
-    text = re.sub(r"(?i)(https?|socks5h?|socks4)://[^\s/@:]+:[^\s/@]+@", r"\1://***:***@", text)
-    text = re.sub(r"(?i)(https?|socks5h?|socks4)://[^\s/]+", r"\1://***@***", text)
-    return text[-2000:]
-
-
-def extract_last_json(stdout):
-    """IPQuality -j emits its final JSON to stdout; other progress/ad text is stderr."""
-    text = (stdout or "").strip()
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    for line in reversed(lines):
-        if line.startswith("{") and line.endswith("}"):
-            try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                continue
-    return None
-
-
-def run_ipquality(proxy_line):
-    proxy, parse_error = parse_proxy(proxy_line)
-    if not proxy:
-        return {"status": "failed", "error": parse_error or "Invalid proxy."}
-
-    command = [
-        "bash",
-        IPQUALITY_SCRIPT,
-        "-E",
-        "-4",
-        "-f",
-        "-j",
-        "-n",
-        "-p",
-        "-x",
-        proxy_url(proxy),
-    ]
-
-    try:
-        started = time.perf_counter()
-        completed = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=IPQUALITY_TIMEOUT,
-            check=False,
-            env={**os.environ, "TERM": "dumb", "CI": "1"},
-        )
-        elapsed_ms = round((time.perf_counter() - started) * 1000)
-        data = extract_last_json(completed.stdout)
-
-        if not data:
-            error = sanitize_error(completed.stderr or completed.stdout or "IPQuality returned no JSON.")
-            return {
-                "status": "failed",
-                "error": error,
-                "returncode": completed.returncode,
-                "elapsed_ms": elapsed_ms,
-            }
-
-        return {
-            "status": "online",
-            "data": data,
-            "returncode": completed.returncode,
-            "elapsed_ms": elapsed_ms,
-        }
-    except subprocess.TimeoutExpired:
-        return {"status": "failed", "error": f"IPQuality timed out after {IPQUALITY_TIMEOUT} seconds."}
-    except Exception as exc:
-        return {"status": "failed", "error": sanitize_error(exc)}
-
-
-def normalize_value(value):
-    if value in (None, "", "null"):
-        return None
-    return value
-
-
-def risk_from_score(value, provider):
-    if value is None:
-        return None
-    try:
-        score = float(str(value).replace("%", "").strip())
-    except (ValueError, TypeError):
-        return None
-
-    # These thresholds match the upstream script's score bands closely.
-    if provider.lower() == "scamalytics":
-        return "VeryHigh" if score >= 100 else "High" if score >= 60 else "Medium" if score >= 20 else "Low"
-    if provider.lower() == "ip2location":
-        return "VeryHigh" if score >= 99 else "High" if score >= 66 else "Medium" if score >= 33 else "Low"
-    if provider.lower() == "abuseipdb":
-        return "VeryHigh" if score >= 100 else "High" if score >= 25 else "Low"
-    if provider.lower() == "dbip":
-        return "VeryHigh" if score >= 100 else "High" if score >= 66 else "Medium" if score >= 33 else "Low"
-    if provider.lower() == "ipqs":
-        return "VeryHigh" if score >= 100 else "High" if score >= 85 else "Medium" if score >= 75 else "Low"
-    return None
-
-
-def summarize(data):
-    """Read IPQuality's real JSON schema instead of searching leaf keys generically."""
-    if not isinstance(data, dict):
-        return {}
-
-    head = data.get("Head") or {}
-    info = data.get("Info") or {}
-    city = info.get("City") or {}
-    region = info.get("Region") or {}
-    typ = data.get("Type") or {}
-    usage = typ.get("Usage") or {}
-    company = typ.get("Company") or {}
-    score = data.get("Score") or {}
-    factor = data.get("Factor") or {}
-    factor_cc = factor.get("CountryCode") or {}
-    factor_proxy = factor.get("Proxy") or {}
-    factor_tor = factor.get("Tor") or {}
-    factor_vpn = factor.get("VPN") or {}
-    factor_server = factor.get("Server") or {}
-    factor_abuser = factor.get("Abuser") or {}
-    factor_robot = factor.get("Robot") or {}
-
-    usage_values = {k: normalize_value(v) for k, v in usage.items() if normalize_value(v) is not None}
-    company_values = {k: normalize_value(v) for k, v in company.items() if normalize_value(v) is not None}
-    score_values = {k: normalize_value(v) for k, v in score.items() if normalize_value(v) is not None}
-
-    factors = {
-        "country_code": {k: normalize_value(v) for k, v in factor_cc.items()},
-        "proxy": {k: normalize_value(v) for k, v in factor_proxy.items()},
-        "tor": {k: normalize_value(v) for k, v in factor_tor.items()},
-        "vpn": {k: normalize_value(v) for k, v in factor_vpn.items()},
-        "server": {k: normalize_value(v) for k, v in factor_server.items()},
-        "abuser": {k: normalize_value(v) for k, v in factor_abuser.items()},
-        "robot": {k: normalize_value(v) for k, v in factor_robot.items()},
-    }
-
-    # IPQuality silently drops into "lite mode" when its own relay
-    # (ipinfo.check.place) fails on the very first lookup. In lite mode it
-    # skips IP2Location, Scamalytics, AbuseIPDB, ipdata, and IPQS as a group
-    # — with no flag anywhere in the JSON saying so. Detect that pattern here
-    # so the UI can say why those fields are empty instead of leaving silent
-    # blanks, per the "no false data / no mystery blanks" requirement.
-    lite_mode_providers = ["IP2LOCATION", "SCAMALYTICS", "AbuseIPDB", "ipdata", "IPQS"]
-    lite_mode_detected = all(
-        score_values.get(p) is None
-        and all((factors[f].get(p) is None) for f in ("proxy", "tor", "vpn", "server", "abuser", "robot"))
-        for p in lite_mode_providers
-    )
-
-    return {
-        "ip": normalize_value(head.get("IP")),
-        "asn": normalize_value(info.get("ASN")),
-        "organization": normalize_value(info.get("Organization")),
-        "latitude": normalize_value(info.get("Latitude")),
-        "longitude": normalize_value(info.get("Longitude")),
-        "city": normalize_value(city.get("Name")),
-        "postal_code": normalize_value(city.get("PostalCode")),
-        "subdivision": normalize_value(city.get("Subdivisions")),
-        "region": normalize_value(region.get("Name")),
-        "country_code": normalize_value(region.get("Code")),
-        "country": normalize_value(region.get("Name")),
-        "timezone": normalize_value(info.get("TimeZone")),
-        "ip_type": normalize_value(info.get("Type")),
-        "usage": usage_values,
-        "company": company_values,
-        "scores": score_values,
-        "factors": factors,
-        "version": normalize_value(head.get("Version")),
-        "sources": {
-            "basic": "MaxMind/IPinfo (from IPQuality)",
-            "usage": "IPQuality: IPinfo / ipregistry / ipapi / AbuseIPDB / IP2Location",
-            "scores": "IPQuality: IP2Location / Scamalytics / ipapi / AbuseIPDB / IPQS / DB-IP",
-            "factors": "IPQuality: IP2Location / ipapi / ipregistry / IPQS / Scamalytics / ipdata / IPinfo / IPWHOIS / DB-IP",
-        },
-        "lite_mode": lite_mode_detected,
-        "lite_mode_reason": (
-            "IPQuality's basic-info relay (ipinfo.check.place) is behind a "
-            "Cloudflare WAF that rejected this proxy's exit IP (HTTP 403), so "
-            "the engine skipped IP2Location, Scamalytics, AbuseIPDB, ipdata, "
-            "and IPQS for this run. ASN, Organization, and Location still came "
-            "through via an independent fallback source (IPinfo) and remain "
-            "reliable. This is an infrastructure block on the relay's side, "
-            "not a bug — see RELAY_BLOCK_NOTICE.txt."
-        ) if lite_mode_detected else None,
-    }
-
-
-LITE_MODE_PROVIDERS = {"IP2LOCATION", "SCAMALYTICS", "AbuseIPDB", "ipdata", "IPQS"}
-
-
-def provider_table(summary):
-    usage = summary.get("usage") or {}
-    company = summary.get("company") or {}
-    scores = summary.get("scores") or {}
-    factors = summary.get("factors") or {}
-    lite_mode = summary.get("lite_mode", False)
-
-    order = ["IPinfo", "ipregistry", "ipapi", "AbuseIPDB", "IP2LOCATION", "SCAMALYTICS", "IPQS", "DBIP", "ipdata", "IPWHOIS"]
-    providers = {}
-    for name in order:
-        skipped = lite_mode and name in LITE_MODE_PROVIDERS
-        providers[name] = {
-            "usage": usage.get(name),
-            "company": company.get(name),
-            "score": scores.get(name),
-            "risk": risk_from_score(scores.get(name), name),
-            "country_code": (factors.get("country_code") or {}).get(name),
-            "proxy": (factors.get("proxy") or {}).get(name),
-            "tor": (factors.get("tor") or {}).get(name),
-            "vpn": (factors.get("vpn") or {}).get(name),
-            "server": (factors.get("server") or {}).get(name),
-            "abuser": (factors.get("abuser") or {}).get(name),
-            "robot": (factors.get("robot") or {}).get(name),
-            "status": "skipped_relay_unavailable" if skipped else "ok",
-        }
-    return providers
-
-
 def worker(job_id, lines):
     with LOCK:
         JOBS[job_id]["status"] = "running"
         JOBS[job_id]["results"] = [None] * len(lines)
 
     completed_count = 0
+
+    def bump():
+        nonlocal completed_count
+        completed_count += 1
+        JOBS[job_id]["completed"] = completed_count
+
+    # Phase 1: fast exit-IP detection for every proxy (also acts as the
+    # fail-fast pre-flight: dead proxies die here in ~DETECT_TIMEOUT seconds
+    # instead of occupying a full check slot).
+    exit_ips = [None] * len(lines)
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as executor:
         future_map = {
-            executor.submit(run_ipquality, line): (idx, line)
+            executor.submit(_detect_for_line, line): idx
             for idx, line in enumerate(lines)
         }
         for future in as_completed(future_map):
-            idx, line = future_map[future]
+            idx = future_map[future]
+            try:
+                exit_ips[idx] = future.result()
+            except Exception:
+                exit_ips[idx] = None
+
+    # Phase 2: group proxies sharing the same exit IP. The first member of
+    # each group gets the full check; the rest get its result cloned, so
+    # identical exit IPs are never checked twice in a job.
+    primaries = {}   # exit_ip -> index of the proxy that will be fully checked
+    clone_map = {}   # idx -> primary idx
+    for idx, ip in enumerate(exit_ips):
+        if ip is None:
+            continue
+        if ip in primaries:
+            clone_map[idx] = primaries[ip]
+        else:
+            primaries[ip] = idx
+
+    for idx, ip in enumerate(exit_ips):
+        if ip is None:
+            proxy, parse_error = parse_proxy(lines[idx])
+            with LOCK:
+                JOBS[job_id]["results"][idx] = {
+                    "index": idx,
+                    "proxy": lines[idx],
+                    "status": "failed",
+                    "error": parse_error
+                    or f"Proxy unreachable or no exit IP within {DETECT_TIMEOUT}s (detection failed).",
+                    "summary": None,
+                    "ipquality_status": None,
+                }
+                bump()
+
+    # Phase 3: full check for each unique exit IP.
+    primary_results = {}
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as executor:
+        future_map = {
+            executor.submit(check_proxy, lines[p_idx], exit_ip): (p_idx, exit_ip)
+            for exit_ip, p_idx in primaries.items()
+        }
+        for future in as_completed(future_map):
+            p_idx, exit_ip = future_map[future]
             try:
                 result = future.result()
             except Exception as exc:
                 result = {"status": "failed", "error": sanitize_error(exc)}
-
-            summary = summarize(result.get("data")) if result.get("data") else None
-            ipquality_status = None
-            if summary:
-                summary["providers"] = provider_table(summary)
-                # Distinguish "the proxy worked and every provider answered" from
-                # "the proxy worked but some providers were skipped" (this repo's
-                # State C vs State D). A proxy is never marked FAILED just
-                # because a provider group was unavailable.
-                ipquality_status = "partial" if summary.get("lite_mode") else "complete"
-
             result.update({
-                "index": idx,
-                "proxy": line,
-                "summary": summary,
-                "ipquality_status": ipquality_status,
+                "index": p_idx,
+                "proxy": lines[p_idx],
+                "summary": result.get("summary"),
+                # The direct engine either answers or doesn't per provider;
+                # there is no relay/lite-mode state anymore.
+                "ipquality_status": "complete" if result.get("status") == "online" else None,
+                "deduplicated": False,
             })
-
+            primary_results[exit_ip] = result
             with LOCK:
-                JOBS[job_id]["results"][idx] = result
-                completed_count += 1
-                JOBS[job_id]["completed"] = completed_count
+                JOBS[job_id]["results"][p_idx] = result
+                bump()
+
+    # Phase 4: clone primary results onto proxies that share the same exit IP.
+    for idx, p_idx in clone_map.items():
+        source = primary_results.get(exit_ips[p_idx])
+        if source is None:
+            clone = {
+                "index": idx,
+                "proxy": lines[idx],
+                "status": "failed",
+                "error": "Primary check for this exit IP failed.",
+                "summary": None,
+                "ipquality_status": None,
+            }
+        else:
+            clone = copy.deepcopy(source)
+            clone["index"] = idx
+            clone["proxy"] = lines[idx]
+            clone["deduplicated"] = True
+            clone["same_exit_ip_as"] = lines[p_idx]
+            if clone.get("summary"):
+                clone["summary"] = dict(clone["summary"])
+                clone["summary"]["deduplicated_from"] = lines[p_idx]
+                clone["summary"]["sources"] = (
+                    clone["summary"].get("sources")
+                    + f" (result shared with {lines[p_idx]}, same exit IP)"
+                )
+        with LOCK:
+            JOBS[job_id]["results"][idx] = clone
+            bump()
 
     with LOCK:
         JOBS[job_id]["status"] = "done"
+
+
+def _detect_for_line(line):
+    proxy, parse_error = parse_proxy(line)
+    if not proxy:
+        return None
+    return detect_exit_ip(proxy_url(proxy))
 
 
 @app.post("/api/start")

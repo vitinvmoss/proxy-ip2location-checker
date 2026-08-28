@@ -1,8 +1,17 @@
 RELAY BLOCK NOTICE (ipinfo.check.place / lite-mode)
 ====================================================
 
-STATUS: OPEN — infrastructure-level block, no code-side fix exists. Do NOT
-re-open this investigation from scratch; read this first.
+STATUS: RESOLVED BY DESIGN CHANGE (2026-08-28) — the app no longer calls this
+relay at all. checker.py now queries Scamalytics (scamalytics.com/ip/<ip>),
+IP2Location (ip2location.com demo page, embedded PX12 JSON), and IPinfo
+(ipinfo.io) DIRECTLY for the exit IP. Per-proxy wall-clock dropped from
+~55-120s to a few seconds, and lite-mode partial results are gone. The
+historical analysis below is kept for reference. ipquality/ip.sh remains in
+the repo (unused at runtime) in case the IPQuality engine is ever re-enabled.
+
+PREVIOUS STATUS (open while the IPQuality engine was in use): OPEN —
+infrastructure-level block, no code-side fix existed for it. Do NOT re-open
+this investigation from scratch; read this first.
 
 WHAT HAPPENS
 ------------
