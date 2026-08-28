@@ -190,26 +190,100 @@ def _fetch(url):
 
 
 def _lookup_ipinfo(ip):
-    raw = _fetch(f"https://ipinfo.io/{ip}/json")
-    data = json.loads(raw)
-    if "error" in data:
-        raise ValueError(data["error"].get("title") or "ipinfo error")
-    org = (data.get("org") or "").strip()
-    asn = None
-    organization = org
-    m = re.match(r"^(AS\d+)\s+(.*)$", org)
-    if m:
-        asn, organization = m.group(1), m.group(2)
+    """Fetch the ipinfo.io web page for the IP.
+
+    The page's server-rendered Next.js payload embeds everything the JSON API
+    returns keylessly, plus Privacy (vpn/proxy/tor/relay/hosting),
+    Anonymization (residential proxy), and Anycast flags that the keyless
+    JSON API does not include. The backslash-escaped quotes in the embedded
+    JSON are normalized before regex extraction.
+    """
+    html = _fetch(f"https://ipinfo.io/{ip}")
+    blob = html.replace('\\"', '"')
+
+    def jstr(key, start=0):
+        m = re.search(rf'"{key}"\s*:\s*"([^"]*)"', blob[start:])
+        return m.group(1) if m else None
+
+    def jbool(key, start=0):
+        m = re.search(rf'"{key}"\s*:\s*(true|false)', blob[start:])
+        return m.group(1) == "true" if m else None
+
+    hostname = jstr("hostname")
+    city = jstr("city")
+    region = jstr("region")
+    postal = jstr("postal")
+    timezone = jstr("timezone")
+    country_code = jstr("country_code")
+    country = jstr("country")
+    if not country and country_code:
+        # Blob order: geolocation carries the full country name before the code.
+        country = country if len(country_code) > 2 else None
+    if country and len(country) == 2:
+        country = None
+
+    asn_m = re.search(r'"as"\s*:\s*\{[^{}]*?"asn"\s*:\s*"(AS\d+)"', blob)
+    asn = asn_m.group(1) if asn_m else None
+    as_name = None
+    as_domain = None
+    as_route = None
+    as_type = None
+    if asn_m:
+        as_seg = blob[asn_m.start():]
+        m = re.search(r'"name"\s*:\s*"([^"]*)"', as_seg)
+        if m:
+            as_name = m.group(1)
+        m = re.search(r'"domain"\s*:\s*"([^"]*)"', as_seg)
+        if m:
+            as_domain = m.group(1)
+        m = re.search(r'"route"\s*:\s*"([^"]*)"', as_seg)
+        if m:
+            as_route = m.group(1)
+        m = re.search(r'"type"\s*:\s*"([^"]*)"', as_seg)
+        if m:
+            as_type = m.group(1)
+
+    org = as_name or None
+    company_m = re.search(r'"company"\s*:\s*\{[^{}]*?"name"\s*:\s*"([^"]*)"', blob)
+    company = company_m.group(1) if company_m else None
+    abuse_m = re.search(r'"abuse"\s*:\s*\{[^{}]*?"email"\s*:\s*"([^"]*)"', blob)
+
+    anycast = jbool("is_anycast")
+    privacy = {
+        "vpn": jbool("is_vpn"),
+        "proxy": jbool("is_proxy"),
+        "tor": jbool("is_tor"),
+        "relay": jbool("is_relay"),
+        "hosting": jbool("is_hosting"),
+    }
+    # Anonymization section: Residential Proxy detection (provider name and
+    # last-seen date are login-gated on the page, so not available keylessly).
+    res_proxy = jbool("is_res_proxy")
+    anonymization = {"residential_proxy": res_proxy}
+
+    if not any(v is not None for v in privacy.values()) and anycast is None:
+        raise ValueError("ipinfo page did not contain the expected data blob")
+
     return {
-        "ip": data.get("ip"),
-        "hostname": data.get("hostname"),
-        "city": data.get("city"),
-        "region": data.get("region"),
-        "country": data.get("country"),
-        "postal_code": data.get("postal"),
-        "timezone": data.get("timezone"),
+        "ip": ip,
+        "hostname": hostname,
+        "city": city,
+        "region": region,
+        "country": country or country_code,
+        "country_code": country_code,
+        "postal_code": postal,
+        "timezone": timezone,
         "asn": asn,
-        "organization": organization,
+        "as_name": as_name,
+        "as_domain": as_domain,
+        "as_route": as_route,
+        "as_type": as_type,
+        "organization": org,
+        "company": company,
+        "abuse_email": abuse_m.group(1) if abuse_m else None,
+        "anycast": anycast,
+        "privacy": privacy,
+        "anonymization": anonymization,
     }
 
 
@@ -297,14 +371,26 @@ def check_proxy(proxy_line, exit_ip=None):
         "organization": (ipinfo.get("organization") if ipinfo else None)
         or ip2.get("isp")
         or ip2.get("as_name"),
+        "company": (ipinfo.get("company") if ipinfo else None) or ip2.get("isp"),
         "country": ipinfo.get("country") if ipinfo else None,
+        "country_code": ipinfo.get("country_code") if ipinfo else None,
         "region": ipinfo.get("region") if ipinfo else None,
         "city": ipinfo.get("city") if ipinfo else None,
         "postal_code": ipinfo.get("postal_code") if ipinfo else None,
         "timezone": ipinfo.get("timezone") if ipinfo else None,
         "hostname": ipinfo.get("hostname") if ipinfo else None,
+        "as_type": ipinfo.get("as_type") if ipinfo else None,
+        "as_domain": ipinfo.get("as_domain") if ipinfo else None,
+        "as_route": ipinfo.get("as_route") if ipinfo else None,
+        "abuse_email": ipinfo.get("abuse_email") if ipinfo else None,
         "ip_type": _ip_type(ip2),
     }
+
+    if ipinfo:
+        # Privacy / Anonymization / Anycast come from the ipinfo.io page blob.
+        summary["privacy"] = ipinfo.get("privacy")
+        summary["anonymization"] = ipinfo.get("anonymization")
+        summary["anycast"] = ipinfo.get("anycast")
 
     ip2_score = ip2.get("fraud_score")
     ip2_proxy = ip2.get("is_proxy")
@@ -332,7 +418,16 @@ def check_proxy(proxy_line, exit_ip=None):
     summary["sources"] = "Scamalytics + IP2Location + IPinfo (direct lookups, no relay)"
 
     summary["providers"] = {
-        "IPinfo": _provider_entry("ok" if ipinfo else "unavailable", error=ipinfo_err),
+        "IPinfo": _provider_entry(
+            "ok" if ipinfo else "unavailable",
+            error=ipinfo_err,
+            privacy=(ipinfo or {}).get("privacy"),
+            anonymization=(ipinfo or {}).get("anonymization"),
+            anycast=(ipinfo or {}).get("anycast"),
+            as_type=(ipinfo or {}).get("as_type"),
+            company=(ipinfo or {}).get("company"),
+            abuse_email=(ipinfo or {}).get("abuse_email"),
+        ),
         "SCAMALYTICS": _provider_entry(
             "ok" if scam else "unavailable",
             score=(scam or {}).get("score"),
