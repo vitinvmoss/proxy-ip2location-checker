@@ -203,10 +203,6 @@ def worker(job_id, lines):
             if clone.get("summary"):
                 clone["summary"] = dict(clone["summary"])
                 clone["summary"]["deduplicated_from"] = lines[p_idx]
-                clone["summary"]["sources"] = (
-                    clone["summary"].get("sources")
-                    + f" (result shared with {lines[p_idx]}, same exit IP)"
-                )
         with LOCK:
             JOBS[job_id]["results"][idx] = clone
             bump()
