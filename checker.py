@@ -21,9 +21,20 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-DETECT_TIMEOUT = 12          # seconds, per curl through the proxy
+DETECT_TIMEOUT = 20          # seconds, per curl attempt through the proxy. Residential
+                             # gateways can take ~10-15s to answer a CONNECT (success or an
+                             # explicit HTTP rejection like Geonode's 561), so 12s was too short.
+DETECT_ATTEMPTS = 2          # attempts per proxy before labeling it dead (transient gateway
+                             # errors do happen; retrying once rescues those at modest cost).
+DETECT_RETRY_DELAY = 3       # seconds between attempts
+# Mixed HTTPS/HTTP chain: some gateways (observed on Geonode residential) refuse
+# CONNECT tunneling (HTTP 561) for certain sessions while still forwarding plain
+# HTTP GET requests for those same sessions, so detection must not rely on
+# HTTPS-only endpoints. The HTTPS endpoint is tried first because it answers in
+# <1s for healthy sessions; the HTTP endpoints rescue the CONNECT-refused ones.
+DETECT_ENDPOINTS = ("https://ipinfo.io/ip", "http://icanhazip.com", "http://api.ipify.org")
+
 LOOKUP_TIMEOUT = 15          # seconds, per direct provider lookup
-DETECT_ENDPOINTS = ("https://ipinfo.io/ip", "https://icanhazip.com", "https://api.ipify.org")
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -32,6 +43,7 @@ UA = (
 
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _IPV6_RE = re.compile(r"^[0-9a-fA-F:]+$")
+_GATEWAY_HTTP_RE = re.compile(r"Received HTTP code (\d+) from proxy", re.IGNORECASE)
 
 _SCAM_SCORE_RE = re.compile(r"Fraud Score:\s*(\d+)")
 _SCAM_RISK_RE = re.compile(r"(Very High|High|Medium|Low)\s+Risk")
@@ -157,30 +169,79 @@ def sanitize_error(value):
 # --- lookups ---
 
 def _curl_through_proxy(purl, url, timeout=DETECT_TIMEOUT):
-    """Return (text, None) or (None, error). Uses curl so all proxy schemes work."""
+    """Return (text, error) where error is None on success.
+
+    Uses curl (not urllib) so all proxy schemes work, and -sS so the
+    gateway's own verdict (e.g. "Received HTTP code 561 from proxy after
+    CONNECT") is captured in stderr instead of being swallowed.
+    """
     try:
         completed = subprocess.run(
-            ["curl", "-s", "-x", purl, "--max-time", str(timeout), url],
+            ["curl", "-sS", "-x", purl, "--max-time", str(timeout), url],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             timeout=timeout + 5,
             check=False,
         )
+    except subprocess.TimeoutExpired:
+        return None, "timed out"
     except Exception as exc:
         return None, str(exc)
     text = (completed.stdout or "").strip()
-    if completed.returncode != 0 or not text:
-        return None, f"curl exit {completed.returncode}"
-    return text, None
+    if completed.returncode == 0:
+        return (text, None) if text else (None, "empty response")
+    error = (completed.stderr or "").strip()
+    return None, error or f"curl exit {completed.returncode}"
+
+
+def describe_detect_error(value):
+    """Turn raw curl/gateway output into a short, user-facing reason.
+
+    A gateway HTTP answer after CONNECT means the proxy host IS reachable
+    but the provider refused the session - a very different failure from an
+    unreachable proxy, and worth telling the user about.
+    """
+    error = str(value or "")
+    match = _GATEWAY_HTTP_RE.search(error)
+    if match:
+        code = int(match.group(1))
+        if code >= 500:
+            return (
+                f"proxy gateway answered HTTP {code} - provider-side error, "
+                "session likely dead or expired (try fresh credentials)"
+            )
+        return f"proxy gateway answered HTTP {code} (connection rejected)"
+    low = error.lower()
+    if "timed out" in low or "timeout" in low:
+        return "proxy connection timed out"
+    if "failed to connect" in low or "couldn't connect" in low or "exit 7" in low:
+        return "could not connect to the proxy host"
+    if not error:
+        return ""
+    return sanitize_error(error)[:300]
 
 
 def detect_exit_ip(purl):
-    for endpoint in DETECT_ENDPOINTS:
-        text, _ = _curl_through_proxy(purl, endpoint)
-        if text and (_IPV4_RE.match(text) or _IPV6_RE.match(text)):
-            return text
-    return None
+    """Return (exit_ip, error). Retries transient failures once.
+
+    Tries every endpoint in each attempt, including the plain-HTTP ones: a
+    gateway CONNECT rejection (e.g. Geonode's 561) does NOT mean the session
+    is dead - those sessions often still forward plain HTTP GET requests, so
+    giving up after the HTTPS endpoint would falsely report live proxies as
+    failed. The retry rides out one-off gateway blips.
+    """
+    last_error = None
+    for attempt in range(1, DETECT_ATTEMPTS + 1):
+        for endpoint in DETECT_ENDPOINTS:
+            text, error = _curl_through_proxy(purl, endpoint)
+            if text and (_IPV4_RE.match(text) or _IPV6_RE.match(text)):
+                return text, None
+            if error:
+                last_error = error
+        if attempt < DETECT_ATTEMPTS:
+            time.sleep(DETECT_RETRY_DELAY)
+    return None, describe_detect_error(last_error)
 
 
 def _fetch(url):
@@ -350,11 +411,12 @@ def check_proxy(proxy_line, exit_ip=None):
         return {"status": "failed", "error": parse_error or "Invalid proxy."}
 
     if not exit_ip:
-        exit_ip = detect_exit_ip(proxy_url(proxy))
+        exit_ip, detect_error = detect_exit_ip(proxy_url(proxy))
         if not exit_ip:
+            detail = detect_error or "no exit IP returned by the proxy"
             return {
                 "status": "failed",
-                "error": f"Proxy unreachable or no exit IP within {DETECT_TIMEOUT}s (detection failed).",
+                "error": f"Detection failed: {detail}.",
             }
 
     with ThreadPoolExecutor(max_workers=3) as pool:

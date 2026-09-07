@@ -21,7 +21,6 @@ COOKIE = "proxy_checker_auth"
 MAX_AGE = 30 * 24 * 3600
 MAX_PROXIES = 20
 MAX_CONCURRENT = 4
-DETECT_TIMEOUT = 12
 
 JOBS = {}
 LOCK = threading.Lock()
@@ -111,10 +110,13 @@ def worker(job_id, lines):
         completed_count += 1
         JOBS[job_id]["completed"] = completed_count
 
-    # Phase 1: fast exit-IP detection for every proxy (also acts as the
-    # fail-fast pre-flight: dead proxies die here in ~DETECT_TIMEOUT seconds
-    # instead of occupying a full check slot).
+    # Phase 1: exit-IP detection for every proxy (also acts as the fail-fast
+    # pre-flight: dead or rejected proxies die here instead of occupying a
+    # full check slot). The error is kept so failed rows can explain WHY
+    # (gateway HTTP rejection vs timeout vs unreachable) instead of showing
+    # one generic message.
     exit_ips = [None] * len(lines)
+    detect_errors = [None] * len(lines)
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as executor:
         future_map = {
             executor.submit(_detect_for_line, line): idx
@@ -123,7 +125,9 @@ def worker(job_id, lines):
         for future in as_completed(future_map):
             idx = future_map[future]
             try:
-                exit_ips[idx] = future.result()
+                ip, error = future.result()
+                exit_ips[idx] = ip
+                detect_errors[idx] = error
             except Exception:
                 exit_ips[idx] = None
 
@@ -143,13 +147,20 @@ def worker(job_id, lines):
     for idx, ip in enumerate(exit_ips):
         if ip is None:
             proxy, parse_error = parse_proxy(lines[idx])
+            detect_error = detect_errors[idx]
+            message = parse_error
+            if not message:
+                message = (
+                    f"Detection failed: {detect_error}."
+                    if detect_error
+                    else "Proxy unreachable (no exit IP returned)."
+                )
             with LOCK:
                 JOBS[job_id]["results"][idx] = {
                     "index": idx,
                     "proxy": lines[idx],
                     "status": "failed",
-                    "error": parse_error
-                    or f"Proxy unreachable or no exit IP within {DETECT_TIMEOUT}s (detection failed).",
+                    "error": message,
                     "summary": None,
                     "ipquality_status": None,
                 }
@@ -214,7 +225,7 @@ def worker(job_id, lines):
 def _detect_for_line(line):
     proxy, parse_error = parse_proxy(line)
     if not proxy:
-        return None
+        return None, None
     return detect_exit_ip(proxy_url(proxy))
 
 
