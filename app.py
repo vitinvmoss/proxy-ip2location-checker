@@ -10,7 +10,7 @@ import copy
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from checker import check_proxy, detect_exit_ip, parse_proxy, proxy_url, sanitize_error
+from checker import check_proxy, detect_exit_ip, parse_proxy, parse_bare_ip, proxy_url, sanitize_error
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -213,9 +213,10 @@ def worker(job_id, lines):
 
 def _detect_for_line(line):
     proxy, parse_error = parse_proxy(line)
-    if not proxy:
-        return None
-    return detect_exit_ip(proxy_url(proxy))
+    if proxy:
+        return detect_exit_ip(proxy_url(proxy))
+    # A bare IP needs no exit detection: it is its own address.
+    return parse_bare_ip(line)
 
 
 @app.post("/api/start")

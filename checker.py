@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 DETECT_TIMEOUT = 12          # seconds, per curl through the proxy
 LOOKUP_TIMEOUT = 15          # seconds, per direct provider lookup
+WHOER_TIMEOUT = 15           # seconds, per whoer.to fetch through the proxy
 DETECT_ENDPOINTS = ("https://ipinfo.io/ip", "https://icanhazip.com", "https://api.ipify.org")
 
 UA = (
@@ -135,6 +136,32 @@ def parse_proxy(line):
         return _make_proxy(line, scheme, parts[0], parts[1], parts[2], "")
 
     return None, "Unsupported proxy format."
+
+
+def parse_bare_ip(line):
+    """Return the address if the line is a bare IPv4/IPv6 address (no proxy).
+
+    Called only after parse_proxy() rejects the line, so proxy formats such as
+    host:port:user:pass are never mistaken for an address.
+    """
+    text = (line or "").strip()
+    if not text or " " in text or "/" in text or "@" in text:
+        return None
+    if _IPV4_RE.match(text):
+        octets = text.split(".")
+        if all(octet.isdigit() and 0 <= int(octet) <= 255 for octet in octets):
+            return text
+        return None
+    if ":" in text and _IPV6_RE.match(text):
+        groups = text.split(":")
+        if "::" in text:
+            return text
+        # A full (uncompressed) IPv6 address is exactly 8 hex groups.
+        if len(groups) == 8 and all(
+            1 <= len(group) <= 4 for group in groups
+        ):
+            return text
+    return None
 
 
 def proxy_url(proxy):
@@ -316,6 +343,87 @@ def _lookup_ip2location(ip):
     return fields
 
 
+# --- whoer ---
+
+_WHOER_VPN_CELL_RE = re.compile(
+    r"<strong>VPN</strong></td>\s*<td[^>]*>(.*?)</td>", re.IGNORECASE | re.DOTALL
+)
+_WHOER_MTU_RE = re.compile(r"\bMTU\s+(\d{2,5})\b", re.IGNORECASE)
+
+
+def _nuxt_value(payload, key):
+    """Resolve one key inside whoer.com's __NUXT_DATA__ JSON array."""
+    for node in payload:
+        if isinstance(node, dict) and key in node:
+            value = node[key]
+            if isinstance(value, int) and 0 <= value < len(payload):
+                value = payload[value]
+            if isinstance(value, list) and len(value) == 2 and isinstance(value[1], int) \
+                    and 0 <= value[1] < len(payload):
+                value = payload[value[1]]
+            return value
+    return None
+
+
+def _bool_or_none(value):
+    if isinstance(value, bool):
+        return value
+    if value in (0, 1):
+        return bool(value)
+    return None
+
+
+def _lookup_whoer_ip(ip):
+    """whoer.com per-IP lookup: proxy yes/no (plus VPN / blacklist / ISP score).
+
+    whoer.com is a Nuxt app whose server-rendered __NUXT_DATA__ payload carries
+    the same flags the page renders, so no browser or JS is needed.
+    """
+    html = _fetch(f"https://whoer.com/ip/{ip}/")
+    m = re.search(r'id="__NUXT_DATA__"[^>]*>(\[.*?\])</script>', html, re.DOTALL)
+    if not m:
+        raise ValueError("whoer.com page did not contain the expected data payload")
+    try:
+        payload = json.loads(m.group(1))
+    except ValueError as exc:
+        raise ValueError("whoer.com data payload was not valid JSON") from exc
+
+    proxy = _bool_or_none(_nuxt_value(payload, "is_public_proxy"))
+    if proxy is None:
+        raise ValueError("no proxy verdict found on whoer.com page")
+    return {
+        "proxy": proxy,
+        "anonymous_vpn": _bool_or_none(_nuxt_value(payload, "is_anonymous_vpn")),
+        "blacklisted": _bool_or_none(_nuxt_value(payload, "is_route_ip_black_list")),
+        "isp_score": _nuxt_value(payload, "isp_score"),
+        "isp": _nuxt_value(payload, "isp"),
+    }
+
+
+def _whoer_live(purl):
+    """whoer.to homepage fetched THROUGH the proxy: tunnel verdict + MTU.
+
+    whoer.to derives MTU from the TCP handshake of the requesting connection,
+    so the value only exists when the request actually travels via the proxy.
+    """
+    text, err = _curl_through_proxy(purl, "https://whoer.to/", timeout=WHOER_TIMEOUT)
+    if not text:
+        raise ValueError(err or "whoer.to unreachable through the proxy")
+    m = _WHOER_VPN_CELL_RE.search(text)
+    if not m:
+        raise ValueError("whoer.to page had no VPN/MTU cell")
+    cell = re.sub(r"<[^>]+>", " ", m.group(1))
+    cell = re.sub(r"\s+", " ", cell).strip()
+    mtu_match = _WHOER_MTU_RE.search(cell)
+    low = cell.lower()
+    detected = True if low.startswith("yes") else False if low.startswith("no") else None
+    return {
+        "detected": detected,
+        "mtu": int(mtu_match.group(1)) if mtu_match else None,
+        "detail": cell,
+    }
+
+
 def _safe(fn, arg):
     try:
         return fn(arg), None
@@ -346,24 +454,38 @@ def check_proxy(proxy_line, exit_ip=None):
     """
     started = time.perf_counter()
     proxy, parse_error = parse_proxy(proxy_line)
+    bare_ip = None
     if not proxy:
-        return {"status": "failed", "error": parse_error or "Invalid proxy."}
+        bare_ip = parse_bare_ip(proxy_line)
+        if not bare_ip:
+            return {"status": "failed", "error": parse_error or "Invalid proxy."}
 
     if not exit_ip:
-        exit_ip = detect_exit_ip(proxy_url(proxy))
-        if not exit_ip:
-            return {
-                "status": "failed",
-                "error": f"Proxy unreachable or no exit IP within {DETECT_TIMEOUT}s (detection failed).",
-            }
+        if bare_ip:
+            exit_ip = bare_ip
+        else:
+            exit_ip = detect_exit_ip(proxy_url(proxy))
+            if not exit_ip:
+                return {
+                    "status": "failed",
+                    "error": f"Proxy unreachable or no exit IP within {DETECT_TIMEOUT}s (detection failed).",
+                }
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    # The whoer.to fetch only makes sense when there is a proxy to travel
+    # through; a bare IP line has no route, so it is skipped there.
+    with ThreadPoolExecutor(max_workers=5) as pool:
         f_ipinfo = pool.submit(_safe, _lookup_ipinfo, exit_ip)
         f_scam = pool.submit(_safe, _lookup_scamalytics, exit_ip)
         f_ip2 = pool.submit(_safe, _lookup_ip2location, exit_ip)
+        f_whoer = pool.submit(_safe, _lookup_whoer_ip, exit_ip)
+        f_live = pool.submit(_safe, _whoer_live, proxy_url(proxy)) if proxy else None
         ipinfo, ipinfo_err = f_ipinfo.result()
         scam, scam_err = f_scam.result()
         ip2, ip2_err = f_ip2.result()
+        whoer, whoer_err = f_whoer.result()
+        live, live_err = f_live.result() if f_live else (None, None)
+
+    mtu = live.get("mtu") if live else None
 
     ip2_score = ip2.get("fraud_score") if ip2 else None
     ip2_proxy = ip2.get("is_proxy") if ip2 else None
@@ -418,7 +540,18 @@ def check_proxy(proxy_line, exit_ip=None):
     summary["usage"] = {"IP2LOCATION": summary["ip_type"]} if summary["ip_type"] else {}
     summary["scamalytics_risk"] = (scam or {}).get("risk")
     summary["lite_mode"] = False
-    summary["sources"] = "Scamalytics + IP2Location + IPinfo (direct lookups, no relay)"
+    summary["sources"] = "Scamalytics + IP2Location + IPinfo + Whoer (direct lookups, no relay)"
+    # whoer.com per-IP verdict and whoer.to MTU (proxy routes only).
+    summary["whoer"] = {
+        "proxy": (whoer or {}).get("proxy"),
+        "anonymous_vpn": (whoer or {}).get("anonymous_vpn"),
+        "blacklisted": (whoer or {}).get("blacklisted"),
+        "isp_score": (whoer or {}).get("isp_score"),
+        "vpn_detected": (live or {}).get("detected"),
+        "mtu": mtu,
+        "live_detail": (live or {}).get("detail"),
+    }
+    summary["mtu"] = mtu
 
     summary["providers"] = {
         "IPinfo": _provider_entry(
@@ -445,11 +578,22 @@ def check_proxy(proxy_line, exit_ip=None):
             usage_type=ip2.get("usage_type") if ip2 else None,
             error=ip2_err,
         ),
+        "WHOER": _provider_entry(
+            "ok" if whoer or live else "unavailable",
+            proxy=(whoer or {}).get("proxy"),
+            anonymous_vpn=(whoer or {}).get("anonymous_vpn"),
+            blacklisted=(whoer or {}).get("blacklisted"),
+            isp_score=(whoer or {}).get("isp_score"),
+            vpn_detected=(live or {}).get("detected"),
+            mtu=mtu,
+            live_detail=(live or {}).get("detail"),
+            error=whoer_err or live_err,
+        ),
     }
 
-    # All three providers down while the proxy itself works -> still online,
+    # Every provider down while the proxy itself works -> still online,
     # but flagged so the UI can explain the empty score columns.
-    if not ipinfo and not scam and not ip2:
+    if not ipinfo and not scam and not ip2 and not whoer:
         summary["providers_error"] = "All provider lookups failed for this exit IP."
 
     return {
