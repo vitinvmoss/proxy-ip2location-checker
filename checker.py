@@ -412,20 +412,6 @@ _WHOER_VPN_CELL_RE = re.compile(
 _WHOER_MTU_RE = re.compile(r"\bMTU\s+(\d{2,5})\b", re.IGNORECASE)
 
 
-def _nuxt_value(payload, key):
-    """Resolve one key inside whoer.com's __NUXT_DATA__ JSON array."""
-    for node in payload:
-        if isinstance(node, dict) and key in node:
-            value = node[key]
-            if isinstance(value, int) and 0 <= value < len(payload):
-                value = payload[value]
-            if isinstance(value, list) and len(value) == 2 and isinstance(value[1], int) \
-                    and 0 <= value[1] < len(payload):
-                value = payload[value[1]]
-            return value
-    return None
-
-
 def _bool_or_none(value):
     if isinstance(value, bool):
         return value
@@ -434,30 +420,58 @@ def _bool_or_none(value):
     return None
 
 
+def _whoer_api(path, ip):
+    """Call whoer.com's own JSON API and return its `data` object."""
+    url = "https://whoer.com/api_v1/" + path + "?" + urllib.parse.urlencode({"ip": ip})
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Accept": "application/json",
+            "Referer": "https://whoer.com/",
+            "Origin": "https://whoer.com",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=LOOKUP_TIMEOUT) as resp:
+        body = json.loads(resp.read().decode("utf-8", errors="replace"))
+    if not isinstance(body, dict) or body.get("code") != 200:
+        raise ValueError(f"whoer.com {path} returned an error")
+    data = body.get("data")
+    return data if isinstance(data, dict) else {}
+
+
 def _lookup_whoer_ip(ip):
-    """whoer.com per-IP lookup: proxy yes/no (plus VPN / blacklist / ISP score).
+    """whoer.com per-IP lookup: the "Proxy: Yes/No" verdict the site shows.
 
-    whoer.com is a Nuxt app whose server-rendered __NUXT_DATA__ payload carries
-    the same flags the page renders, so no browser or JS is needed.
+    whoer.com renders that verdict client-side from its /ip/riskip endpoint:
+    the page shows "Yes" exactly when risk_score > 0. The server-rendered
+    __NUXT_DATA__ payload also carries an `is_public_proxy` flag, but it is
+    hard-coded false for every IP, so reading it reports "No" everywhere.
     """
-    html = _fetch(f"https://whoer.com/ip/{ip}/")
-    m = re.search(r'id="__NUXT_DATA__"[^>]*>(\[.*?\])</script>', html, re.DOTALL)
-    if not m:
-        raise ValueError("whoer.com page did not contain the expected data payload")
-    try:
-        payload = json.loads(m.group(1))
-    except ValueError as exc:
-        raise ValueError("whoer.com data payload was not valid JSON") from exc
+    risk = _whoer_api("ip/riskip", ip)
+    score = risk.get("risk_score")
+    if not isinstance(score, (int, float)) or isinstance(score, bool):
+        raise ValueError("no proxy verdict returned by whoer.com")
 
-    proxy = _bool_or_none(_nuxt_value(payload, "is_public_proxy"))
-    if proxy is None:
-        raise ValueError("no proxy verdict found on whoer.com page")
+    # Everything below is cosmetic detail for the details modal; if it fails
+    # the primary verdict above still stands.
+    info = {}
+    try:
+        info = _whoer_api("index/index", ip).get("ip") or {}
+    except Exception:
+        pass
+    if not isinstance(info, dict):
+        info = {}
+
     return {
-        "proxy": proxy,
-        "anonymous_vpn": _bool_or_none(_nuxt_value(payload, "is_anonymous_vpn")),
-        "blacklisted": _bool_or_none(_nuxt_value(payload, "is_route_ip_black_list")),
-        "isp_score": _nuxt_value(payload, "isp_score"),
-        "isp": _nuxt_value(payload, "isp"),
+        "proxy": score > 0,
+        "risk_score": score,
+        "proxy_brands": risk.get("proxy_brands") or [],
+        "risk_evidence": risk.get("risk_evidence") or [],
+        "anonymous_vpn": _bool_or_none(info.get("is_anonymous_vpn")),
+        "blacklisted": _bool_or_none(info.get("is_route_ip_black_list")),
+        "isp_score": info.get("isp_score"),
+        "isp": info.get("isp"),
     }
 
 
@@ -606,6 +620,8 @@ def check_proxy(proxy_line, exit_ip=None):
     # whoer.com per-IP verdict and whoer.to MTU (proxy routes only).
     summary["whoer"] = {
         "proxy": (whoer or {}).get("proxy"),
+        "risk_score": (whoer or {}).get("risk_score"),
+        "proxy_brands": (whoer or {}).get("proxy_brands"),
         "anonymous_vpn": (whoer or {}).get("anonymous_vpn"),
         "blacklisted": (whoer or {}).get("blacklisted"),
         "isp_score": (whoer or {}).get("isp_score"),
